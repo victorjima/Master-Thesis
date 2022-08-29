@@ -1,0 +1,485 @@
+---
+title: <span style="font-family:Georgia;">Characterization of somatic mutations landscape</span>
+author: "Víctor Jiménez Martínez"
+date: "2022"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Introduction
+
+The main goal of this script is to depict and show the mutational landscape of somatic mutations in our cohort. 
+
+## Libraries 
+
+Libraries needed for the analysis are loaded below. 
+
+```{r, results="hide", message=FALSE, warning=FALSE}
+# R version employed for this script is 4.2.0
+library(tidyr)
+library(dplyr)
+library(RColorBrewer)
+library(ggplot2)
+library(ggh4x)
+library(org.Hs.eg.db)
+library(ggpubr)
+library(venn)
+```
+
+## Load and merge data 
+
+First of all, data is loaded and prepared for the analyses. 
+
+```{r}
+# SNV data
+snv <- read.delim("/omics/groups/OE0436/data/jimenez/data/snv_indels/vcf/all_snvs_all_patients_metastasis2_definitive.vcf")  
+
+# Filter rows that do not represent a somatic mutation and select those interesting fields
+snv_select <- snv %>% 
+  filter(RECLASSIFICATION=="somatic" | RECLASSIFICATION=="somatic_precious") %>%
+  dplyr::select(PID, GENE, ANNOVAR_FUNCTION, EXONIC_CLASSIFICATION, X.CHROM, POS)
+
+# Add mutation level
+snv_select$mut_level <- paste(snv_select$ANNOVAR_FUNCTION, snv_select$EXONIC_CLASSIFICATION, sep = "_")
+snv_select$mut_level = gsub("_\\.", "", snv_select$mut_level)
+snv_select$mut_level = gsub(" ", "_", gsub(";", "_", snv_select$mut_level))
+
+# Modify mutation levels
+snv_select$mut_level[snv_select$mut_level == "exonic_stopgain"] <- "stopgain"
+snv_select$mut_level[snv_select$mut_level == "exonic_stoploss"] <- "stoploss"
+snv_select$mut_level[snv_select$mut_level == "exonic_nonsynonymous_SNV"] <- "nonsynonymous SNV"
+snv_select$mut_level[snv_select$mut_level == "exonic_splicing_unknown" |
+                       snv_select$mut_level == "exonic_splicing_nonsynonymous_SNV" |
+                       snv_select$mut_level == "exonic_splicing_synonymous_SNV"] <- "splicing"
+
+# Compute snv per patient
+snv_per_patient <- snv_select %>%
+  dplyr::group_by(PID, mut_level) %>%
+  dplyr::tally() %>%
+  dplyr::rename(n_SNV = n)
+
+# INDEL data 
+indel <- read.delim("/omics/groups/OE0436/data/jimenez/data/snv_indels/vcf/all_indels_all_patients_metastasis2_definitive.vcf") 
+
+# Filter rows that do not represent a somatic mutation and select those interesting fields
+indel_select <- indel %>%
+  dplyr::select(PID, GENE, ANNOVAR_FUNCTION, EXONIC_CLASSIFICATION, X.CHROM, POS)
+
+# Add mutation level
+indel_select$mut_level <- paste(indel_select$ANNOVAR_FUNCTION, indel_select$EXONIC_CLASSIFICATION, sep = "_")
+indel_select$mut_level = gsub("_\\.", "", indel_select$mut_level)
+indel_select$mut_level = gsub(" ", "_", gsub(";", "_", indel_select$mut_level))
+
+# Modify mutation levels
+indel_select$mut_level[indel_select$mut_level == "exonic_frameshift_deletion"] <- "frameshift deletion"
+indel_select$mut_level[indel_select$mut_level == "exonic_frameshift_insertion"] <- "frameshift insertion"
+indel_select$mut_level[indel_select$mut_level == "exonic_nonframeshift_deletion"] <- "nonframeshift deletion"
+indel_select$mut_level[indel_select$mut_level == "exonic_nonframeshift_insertion"] <- "nonframeshift insertion"
+indel_select$mut_level[indel_select$mut_level == "exonic_unknown"] <- "unknown"
+indel_select$mut_level[indel_select$mut_level == "exonic_stopgain"] <- "stopgain"
+
+# Compute indel per patient
+indel_per_patient <- indel_select %>%
+  dplyr::group_by(PID, mut_level) %>%
+  dplyr::tally() %>%
+  dplyr::rename(n_SNV = n)
+
+# Combine snvs and indels
+snv_indels <- rbind(snv_select, indel_select)
+snv_indels_met2 <- rbind(snv_select, indel_select) # repeat process reading the correspondant files
+
+# Remove exon information from "splicing" SNVs
+snv_indels$GENE = gsub("\\(.*", "", snv_indels$GENE)
+snv_indels_met2$GENE = gsub("\\(.*", "", snv_indels_met2$GENE) # process with the correspondant files
+```
+
+## Depicting all mutations
+
+```{r}
+# Build data frame with all alteration per patient and their correspondant information
+mut_per_patient <- merge(snv_per_patient, indel_per_patient, all = TRUE)
+colnames(mut_per_patient) <- c("PID", "Alteration", "n")
+
+
+# # mut_per_patient$code <- unlist(lapply(strsplit(mut_per_patient$PID, "-"), function(x) x[2]))
+# mut_per_patient$Alteration <- ifelse(mut_per_patient$n %in% indel_per_patient$n_SNV, "INDEL", "SNV")
+
+# Clinical data 
+pheno <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/PID_treatment.csv", 
+                  header = TRUE, sep = ";", row.names = "PID")
+colnames(pheno) = c("therapy", "evolution") 
+pheno <- pheno %>% 
+  mutate(response = ifelse(evolution == "PR", "responders", "non-responders"))
+
+mut_per_patient$response <- ifelse(mut_per_patient$PID %in% 
+                                     rownames(pheno)[pheno$response == "responders"], 
+                                   "responders", "non-responders")
+
+# Build bar plot 
+pdf("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/barplots/mutations_barplot_all_patients_met2_all_alterations.pdf")
+
+ggplot(mut_per_patient, aes(x = PID, y = n)) + 
+  geom_bar(aes(fill = Alteration), stat = "identity", position = "stack") + 
+  ylab("Number of functional somatic alterations (SNV + INDEL)") + 
+  xlab("Metastasis1 samples (pre-treatment)") + theme_bw()  + 
+  facet_wrap(~response, scales = "free_x", strip.position = "top") +
+  theme(axis.text.x = element_text(angle = 60, size = 10, hjust = 1), 
+        axis.ticks.x = element_blank(), 
+        strip.text.x = element_text(size = 10),
+        strip.background = element_rect(fill = "white", color = "black"))
+
+dev.off()
+```
+
+## Tumor Mutational Burden Statistics
+
+```{r}
+# Load data
+tmb_resp <- read.csv(file = "/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/TMB_analysis_resp_pre_allmut.tsv",
+                       header = TRUE, sep = "\t", row.names = "sample")
+tmb_resp$Response <- "responders"
+
+tmb_non <- read.csv(file = "/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/TMB_analysis_nonresp_pre_allmut.tsv",
+                       header = TRUE, sep = "\t", row.names = "sample")
+tmb_non$Response <- "non-responders"
+
+tmb <- rbind(tmb_resp, tmb_non)
+
+# Tests
+shapiro.test(tmb$TMB_All) # not normally distributed
+var.test(tmb$TMB_All ~ tmb$Response) # variances are equal
+
+wilcox.test(tmb$TMB_All ~ tmb$Response, paired = F) # TMB is not significantly different between both groups
+
+tmb$PID <- rownames(tmb)
+
+# Barplot
+pdf("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/TMB_barplot.pdf")
+
+ggplot(tmb, 
+       aes(x = PID, y = TMB_All)) + 
+  # geom_bar(aes(fill = response), stat = "identity", position = "stack") + 
+  geom_bar(stat = "identity", position = "stack", color = "black") +
+  ylab("Tumor mutational burden") + 
+  xlab("Metastasis1 samples (pre-treatment)") + theme_bw()  + 
+  facet_wrap(~Response, scales = "free_x", strip.position = "top") +
+  theme(axis.text.x = element_text(angle = 60, size = 10, hjust = 1), 
+        strip.text.x = element_text(size = 10),
+        strip.background = element_rect(fill = "white", color = "black"))
+
+dev.off()
+
+# Boxplot
+pdf("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/TMB_boxplot.pdf")
+
+ggplot(tmb, aes(x = Response, y = TMB_All)) + 
+  geom_boxplot(aes(fill = Response), alpha = 2) + geom_point() + 
+  scale_fill_manual(values = c("red", "green")) +
+  theme_bw() + ylab("Tumor Mutational Burden (mutations/Mb)") + xlab("Metastasis1 samples (pre-treatment)") +
+  theme(axis.text.x = element_blank()) + 
+  stat_compare_means(paired = FALSE, vjust = TRUE, size = 5, label.x = 1.25, label.y = 15) 
+
+dev.off()
+```
+
+The TMB is not significantly different across our samples. To see if there is any other factor interfering, the coverage of the different samples is checked. 
+
+Let's check in post-treatment samples
+
+```{r}
+# Load data
+tmb_resp_met2 <- read.csv(file = "/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/TMB_analysis_resp_met2_allmut.tsv",
+                       header = TRUE, sep = "\t", row.names = "sample")
+tmb_resp_met2$Response <- "responders"
+
+tmb_non_met2 <- read.csv(file = "/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/TMB_analysis_nonresp_met2_allmut.tsv",
+                       header = TRUE, sep = "\t", row.names = "sample")
+tmb_non_met2$Response <- "non-responders"
+
+tmb_met2 <- rbind(tmb_resp_met2, tmb_non_met2)
+
+# Tests
+shapiro.test(tmb_met2$TMB_All) # not normally distributed
+var.test(tmb_met2$TMB_All ~ tmb_met2$Response) # variances are not equal
+
+wilcox.test(tmb_met2$TMB_All ~ tmb_met2$Response, paired = F) # TMB is not significantly different between both groups, wow
+
+tmb_met2$PID <- rownames(tmb_met2)
+
+# Barplot
+pdf("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/TMB_barplot_met2.pdf")
+
+ggplot(tmb_met2, 
+       aes(x = PID, y = TMB_All)) + 
+  # geom_bar(aes(fill = response), stat = "identity", position = "stack") + 
+  geom_bar(stat = "identity", position = "stack", color = "black") +
+  ylab("Tumor Mutational Burden (mutations/Mb)") + 
+  xlab("Metastasis2 samples (post-treatment)") + theme_bw()  + 
+  facet_wrap(~Response, scales = "free_x", strip.position = "top") +
+  theme(axis.text.x = element_text(angle = 60, size = 10, hjust = 1), 
+        strip.text.x = element_text(size = 10),
+        strip.background = element_rect(fill = "white", color = "black"))
+
+dev.off()
+
+# Boxplot
+pdf("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/TMB_boxplot_met2.pdf")
+
+ggplot(tmb_met2, aes(x = Response, y = TMB_All)) + 
+  geom_boxplot(aes(fill = Response), alpha = 2) + geom_point() + 
+  scale_fill_manual(values = c("red", "green")) +
+  theme_bw() + ylab("Tumor Mutational Burden (mutations/Mb)") + xlab("Metastasis2 samples (post-treatment)") +
+  theme(axis.text.x = element_blank()) + 
+  stat_compare_means(paired = FALSE, vjust = TRUE, size = 5, label.x = 1.25, label.y = 15) 
+
+dev.off()
+```
+
+Let's compare pre and post treatment samples.
+
+```{r}
+# Building data frame for responders
+tmb_resp <- tmb_resp %>% mutate(time = rep("pre_treatment", nrow(tmb_resp)), 
+                                PID = rownames(tmb_resp))
+
+tmb_resp_met2 <- tmb_resp_met2 %>% mutate(time = rep("post_treatment", nrow(tmb_resp_met2)), 
+                                PID = rownames(tmb_resp_met2))
+
+tmb_resp_prepost <- rbind(tmb_resp, tmb_resp_met2)
+
+# Subset for paired samples
+tmb_resp_prepost <- tmb_resp_prepost[tmb_resp_prepost$PID %in% tmb_resp_prepost$PID[which(duplicated(tmb_resp_prepost$PID))], ]
+
+order(tmb_resp_prepost$PID)
+
+# wilcox test: 0.0625
+wilcox.test(tmb_resp_prepost[order(tmb_resp_prepost$PID),]$TMB_All ~ 
+              tmb_resp_prepost[order(tmb_resp_prepost$PID),]$time, paired = T) # TMB is not significantly different between both groups, that's weird...
+
+# Building data frame for non-responders
+tmb_non <- tmb_non %>% mutate(time = rep("pre_treatment", nrow(tmb_non)), 
+                                PID = rownames(tmb_non))
+
+tmb_non_met2 <- tmb_non_met2 %>% mutate(time = rep("post_treatment", nrow(tmb_non_met2)), 
+                                PID = rownames(tmb_non_met2))
+
+tmb_non_prepost <- rbind(tmb_non, tmb_non_met2)
+
+# Subset for paired samples
+tmb_non_prepost <- tmb_non_prepost[tmb_non_prepost$PID %in% tmb_non_prepost$PID[which(duplicated(tmb_non_prepost$PID))], ]
+
+order(tmb_non_prepost$PID)
+
+# wilcox test
+wilcox.test(tmb_non_prepost[order(tmb_non_prepost$PID),]$TMB_All ~ 
+              tmb_non_prepost[order(tmb_non_prepost$PID),]$time, paired = T) # TMB is not significantly different between both groups
+```
+
+Everything all together. 
+
+```{r}
+tmb$Time <- "pre-treatment"
+tmb_met2$Time <- "post-treatment"
+
+tmb_all <- rbind(tmb, tmb_met2)
+
+# Boxplot
+pdf("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/TMB_all_boxplot.pdf")
+
+ggplot(transform(tmb_all, Time = factor(Time, levels = c("pre-treatment", "post-treatment"))), 
+       aes(x = Response, y = TMB_All)) + 
+  geom_boxplot(aes(fill = Response), alpha = 2) + geom_point() + 
+  scale_fill_manual(values = c("red", "green")) +
+  theme_bw() + ylab("Tumor Mutational Burden (mutations/Mb)") + xlab("Samples") +
+  facet_wrap(~ Time, scales = "free_x") +
+  theme(axis.text.x = element_blank(), 
+        strip.background = element_rect(fill = "white", color = "black"),
+        strip.text.x = element_text(size = 12)) + 
+  stat_compare_means(paired = FALSE, vjust = TRUE, size = 5, label.x = 1.25, label.y = 15) 
+
+dev.off()
+
+# Boxplot without the outliers
+pdf("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/TMB_all_boxplot_no_outliers.pdf")
+
+ggplot(transform(tmb_all %>% filter(!PID == "KQX9Y5" & !PID == "1QNKZZ"), 
+                 Time = factor(Time, levels = c("pre-treatment", "post-treatment"))), 
+       aes(x = Response, y = TMB_All)) + 
+  geom_boxplot(aes(fill = Response), alpha = 2) + geom_point() + 
+  scale_fill_manual(values = c("red", "green")) +
+  theme_bw() + ylab("Tumor Mutational Burden (mutations/Mb)") + xlab("Samples") +
+  facet_wrap(~ Time, scales = "free_x") +
+  theme(axis.text.x = element_blank(), 
+        strip.background = element_rect(fill = "white", color = "black"),
+        strip.text.x = element_text(size = 12)) + 
+  stat_compare_means(paired = FALSE, vjust = TRUE, size = 5, label.x = 1.25, label.y = 15) 
+
+dev.off()
+```
+
+## QC Analysis
+
+```{r}
+# Read qc data
+qc <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/QC/WES_Alignment_Quality_Control-hipo_K28A_2022-7-26.csv", 
+                  header = TRUE, sep = ",")
+qc$PID <- unlist(lapply(strsplit(qc$Patient.ID, "-"), function(x) x[2]))
+
+qc_pre <- qc[qc$Sample.Type == "metastasis1", ] # filter the samples
+rownames(qc_pre) <- qc_pre$PID
+qc_pre <- qc_pre[rownames(tmb), ] %>% mutate(Time = rep("pre-treatment", nrow(qc_pre))) # select the ones that have mutation data available
+
+qc_met2 <- qc[qc$Sample.Type == "metastasis2", ] # filter the samples
+rownames(qc_met2) <- qc_met2$PID 
+qc_met2 <- qc_met2[rownames(tmb_met2), ] %>% mutate(Time = rep("post-treatment", nrow(qc_met2))) # select the ones that have mutation data available
+
+# Create dataframe merging both data
+identical(rownames(qc_pre), rownames(tmb))
+identical(rownames(qc_met2), rownames(tmb_met2))
+
+qc_tmb <- data.frame(row.names = rownames(qc_pre), 
+                     "TMB" = tmb$TMB_All, "Coverage" = qc_pre$Coverage, 
+                     "Response" = tmb$Response, "Time" = qc_pre$Time, "PID" = qc_pre$PID)
+
+qc_tmb_met2 <- data.frame(row.names = rownames(qc_met2), 
+                     "TMB" = tmb_met2$TMB_All, "Coverage" = qc_met2$Coverage, 
+                     "Response" = tmb_met2$Response, "Time" = qc_met2$Time, "PID" = qc_met2$PID)
+  
+qc_tmb_all <- rbind(qc_tmb, qc_tmb_met2)
+  
+# Scatter plot
+pdf("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/TMB_QC_correlation_all.pdf")
+
+ggplot(transform(qc_tmb_all, Time = factor(Time, levels = c("pre-treatment", "post-treatment"))), 
+       aes(x = Coverage, y = TMB, color = Response)) + 
+  geom_point(size = 2) + scale_color_manual(values = c("red", "green")) +
+  geom_text(aes(label = qc_tmb_all$PID), size = 3, nudge_x = 0.25, nudge_y = 0.25, 
+            check_overlap = T, color = "black") +
+  ylab("Tumor mutational burden (mutations/Mb)") +
+  xlab("Sequencing coverage") + theme_bw() +
+  facet_wrap(~ Time, scales = "free_x") +
+  theme(strip.background = element_rect(fill = "white", color = "black"),
+        strip.text.x = element_text(size = 12)) +
+  stat_cor(method = "pearson")
+
+
+dev.off()
+```
+
+## Lost mutations
+
+Looking at the specific mutations that are being lost in responders might hint at the kind of lines that the immune checkpoints are targeting. 
+
+```{r}
+# Load pheno data
+pheno <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/PID_treatment.csv", 
+                  header = TRUE, sep = ";", row.names = "PID")
+colnames(pheno) = c("therapy", "evolution") 
+
+pheno <- pheno %>% 
+  mutate(response = ifelse(evolution == "PR", "responders", "non-responders"))
+
+# Filter data to get only the responders found in pre and post treatment samples
+snv_indels_resp <- snv_indels %>% filter(PID %in% rownames(pheno)[pheno$response == "responders"])
+snv_indels_met2_resp <- snv_indels_met2 %>% filter(PID %in% rownames(pheno)[pheno$response == "responders"])
+
+inter_resp <- intersect(unique(snv_indels_resp$PID), unique(snv_indels_met2_resp$PID))
+
+snv_indels_resp <- snv_indels_resp %>% filter(PID %in% inter_resp)
+snv_indels_met2_resp <- snv_indels_met2_resp %>% filter(PID %in% inter_resp)
+
+# Get lost mutations in post-treatment
+# Accounting not only for gene but for the position of the mutation
+lost_genes <- list()
+lost_position <- list()
+list_names <- NULL
+for (patient in inter_resp){
+  # List of genes
+  # g1 <- snv_indels_resp %>% filter(PID == patient) %>% 
+  #   dplyr::select(GENE) %>% unique() %>% .[["GENE"]] 
+  # g2 <- snv_indels_met2_resp %>% filter(PID == patient) %>% 
+  #   dplyr::select(GENE) %>% unique() %>% .[["GENE"]]
+  g1 <- snv_indels_resp %>% filter(PID == patient) %>% 
+    dplyr::select(GENE,POS)
+  g2 <- snv_indels_met2_resp %>% filter(PID == patient) %>% 
+    dplyr::select(GENE) 
+  
+  # Mutated genes found in pre-treatment but not post-treatmet
+  gene_level <- which(!g1$GENE %in% g2$GENE)
+  position_level <- which(!g1$POS %in% g2$POS)
+  
+  lost_genes[[patient]] <- g1$GENE[intersect(gene_level, position_level)]
+  lost_position[[patient]] <- g1$POS[intersect(gene_level, position_level)]
+  }
+
+# Picture with a venn diagram
+pdf("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/venn_diagram_lost_genes_responders.pdf")
+
+venn(lost_genes, ilab = TRUE, zcolor = "style")
+venn(lost_position, ilab = TRUE, zcolor = "style")
+
+dev.off()
+
+# Catch those genes 
+outer(lost_genes, lost_genes, Vectorize(intersect))
+
+repeated_lost_mutations <- unique(c(intersect(lost_genes$`2SXVC6`, lost_genes$EJ6Z3A),
+                         intersect(lost_genes$`2SXVC6`, lost_genes$MG5TH7),
+                         intersect(lost_genes$W5CLRA, lost_genes$EJ6Z3A),
+                         intersect(lost_genes$MG5TH7, lost_genes$EJ6Z3A),
+                         intersect(lost_genes$MG5TH7, lost_genes$W5CLRA),
+                         intersect(lost_genes$MG5TH7, lost_genes$TTXC5Y)))
+
+# Nothing interesting
+# ego_lost <- enrichGO(gene          = bitr(repeated_lost_mutations, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")$ENTREZID,
+#                    keyType       = "ENTREZID",
+#                    OrgDb         = org.Hs.eg.db,
+#                    ont           = "BP",
+#                    pAdjustMethod = "BH",
+#                    pvalueCutoff  = 0.2,
+#                    qvalueCutoff  = 0.2,
+#                    readable      = TRUE)
+# 
+# ek_lost <- enrichKEGG(gene = bitr(repeated_lost_mutations, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")$ENTREZID,
+#                     pvalueCutoff = 0.2,
+#                     qvalueCutoff = 0.2)
+```
+
+ALthough there are loses at the gene level (CR1, SUCO, DST, CSMD3, APOB, TTN), mutations do not coincide in position. 
+
+## Check which mutations in NRAS and FOXJ1
+
+```{r}
+snv <- read.delim("/omics/groups/OE0436/data/jimenez/data/snv_indels/vcf/all_snvs_all_patients_metastasis1_definitive.vcf")  
+
+# Filter rows that do not represent a somatic mutation and select those interesting fields
+snv_select <- snv %>% 
+  filter(RECLASSIFICATION=="somatic" | RECLASSIFICATION=="somatic_precious") %>%
+  dplyr::select(PID, GENE, ANNOVAR_FUNCTION, EXONIC_CLASSIFICATION, X.CHROM, POS, REF, ALT)
+
+# Add mutation level
+snv_select$mut_level <- paste(snv_select$ANNOVAR_FUNCTION, snv_select$EXONIC_CLASSIFICATION, sep = "_")
+snv_select$mut_level = gsub("_\\.", "", snv_select$mut_level)
+snv_select$mut_level = gsub(" ", "_", gsub(";", "_", snv_select$mut_level))
+
+# Modify mutation levels
+snv_select$mut_level[snv_select$mut_level == "exonic_stopgain"] <- "stopgain"
+snv_select$mut_level[snv_select$mut_level == "exonic_stoploss"] <- "stoploss"
+snv_select$mut_level[snv_select$mut_level == "exonic_nonsynonymous_SNV"] <- "nonsynonymous SNV"
+snv_select$mut_level[snv_select$mut_level == "exonic_splicing_unknown" |
+                       snv_select$mut_level == "exonic_splicing_nonsynonymous_SNV" |
+                       snv_select$mut_level == "exonic_splicing_synonymous_SNV"] <- "splicing"
+
+snv_select_resp <- snv_select %>% filter(PID %in% rownames(pheno)[pheno$response == "responders"])
+  
+snv_select_non <- snv_select %>% filter(PID %in% rownames(pheno)[pheno$response == "non-responders"])
+
+# NRAS
+snv_select_resp %>% filter(GENE == "NRAS")
+
+snv_select_non %>% filter(GENE == "FOXJ1")
+```
+
+Mutations in NRAS genes in our cohort are located in positions 115256528 – 115256530 of Chromosome 1, being a nonsynonymous SNV that changes aminoacid Q61. Different variants have been annotated in these positions classified as pathogenic and associated with melanoma in ClinVar: VCV000280409, VCV000013900, VCV000375875.

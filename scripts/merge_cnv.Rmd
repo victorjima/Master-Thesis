@@ -1,0 +1,106 @@
+---
+title: <span style="font-family:Georgia;">Preparation of CNA tables</span>
+author: "Víctor Jiménez Martínez"
+date: "2022"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Introduction
+
+The main goal of this script is to merge and obtain .tsv files with CNA total copy number values per patient. 
+
+## Libraries
+
+Libraries needed for the script are loaded below.
+
+```{r, results="hide", message=FALSE, warning=FALSE}
+library(tidyr) # to manage data
+library(dplyr) # to manage data
+```
+
+## Catching CNA data
+
+```{r}
+# Directory
+# cna_directory <- "/omics/groups/OE0436/internal/eugenie/data/k28a/rna_sequencing/rnaseq_counts/"
+```
+
+## Reading all files and transforming them to TNC matrixes
+
+Explanation
+
+```{r}
+cnv <- read.table(file = "/omics/groups/OE0436/internal/eugenie/data/k28a/exon_sequencing/cnv/K28A-1QNKZZ.metastasis1_comb_pro_extra.withGenes.finalUnsmoothed", sep = '\t', header = TRUE)
+
+tcn_matrix <- function(cnv){
+  # Neutral CNV are left out of the analyses
+  if ("CNA.type" %in% colnames(cnv)){
+    cnv <- cnv %>% dplyr::filter(!CNA.type == "TCNneutral")
+  }else{cnv <- cnv %>% dplyr::filter(!type == "TCNneutral")} # column can be CNA.type or type
+  
+  # Genes affected per each registered CNV
+  genes <- sapply(cnv$geneUnique, function(x) strsplit(x, ",")) 
+  
+  # How many genes affect each observation
+  lengths <- unlist(lapply(genes, length), use.names = FALSE) 
+  
+  # Each gene of each CNV has the same value fo TCN
+  tcn <- NULL
+  type <- NULL
+  for (i in 1:length(lengths)){
+    r <- rep(cnv$tcnMean[i], lengths[i]) 
+    if ("CNA.type" %in% colnames(cnv)){
+      t <- rep(cnv$CNA.type[i], lengths[i])
+    }else{t <- rep(cnv$type[i], lengths[i])}
+    tcn <- c(tcn, r)
+    type <- c(type, t)
+  }
+  
+  # Build data frame
+  df <- data.frame("gene" = unlist(genes, use.names = FALSE),
+                   "tcn" = tcn,
+                   "type" = type)
+  
+  # Compute total tcn if genes are repeated and their type is the same
+  df <- df %>% group_by(gene, type) %>% 
+    summarise(final_tcn = sum(tcn, na.rm = TRUE)) %>% as.data.frame()
+  
+  return(df)
+}
+
+cnvm <- tcn_matrix(cnv)
+
+# Read all of them 
+# Directory
+cna_directory <- "/omics/groups/OE0436/internal/eugenie/data/k28a/exon_sequencing/cnv/"
+
+# List all pre-treatment files
+cna_files <- list.files(path = cna_directory, pattern = "metastasis1")
+pid <- unlist(lapply(lapply(cna_files, function(x) strsplit(x, "-")[[1]][[2]]), function(y) strsplit(y, "\\.")[[1]][[1]]))
+
+# Create table 
+cna <- lapply(paste0(cna_directory, cna_files), function(x) tcn_matrix(read.delim(x)))
+
+# Add PID information
+for (i in 1:21){
+  cna[[i]]$PID <- pid[i] 
+}
+
+# Transform into one matrix
+cna_final <- dplyr::bind_rows(cna) %>% select(gene, final_tcn, PID) %>% 
+  pivot_wider(names_from = PID, values_from = final_tcn, values_fn = sum) %>% as.data.frame()
+rownames(cna_final) <- cna_final$gene
+cna_final <- dplyr::select(cna_final, !gene)
+cna_final[is.na(cna_final)] <- 0 # NAs set to 0
+
+# Save table 
+write.table(cna_final, file = "/omics/groups/OE0436/data/jimenez/data/cna_met1.tsv", 
+            sep = "\t", col.names = TRUE, row.names = TRUE)
+```
+
+
+
+

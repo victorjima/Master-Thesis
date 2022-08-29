@@ -1,0 +1,131 @@
+---
+title: <span style="font-family:Georgia;">Mutational signatures</span>
+author: "Víctor Jiménez Martínez"
+date: "2022"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Introduction
+
+Mutational Signatures^1^ are defined as the unique combination of mutation types associated with different mutational processes (involving DNA replication machinery, endogenous and exogenous mutagen exposures or enzymatic modification of DNA). The analysis was performed considering COSMIC Mutational Signatures, based on the Pan-Cancer Analysis of Whole Genomes (PCAWG)^2^ dataset. The determination of the SNV and INDEL contributions to the mutational signatures was conducted through R package Yet Another Package For Signature Analysis (YAPSA)^3^. YAPSA computes the contri-butions (H) of every signature (W) to every sample consider-ing the mutational catalogue (V) implementing a family of functions called LCD() (linear combination decomposition) based on non-negative least squares (NNLS).
+
+## Libraries
+
+Libraries needed for the script are loaded below.
+
+```{r, results="hide", message=FALSE, warning=FALSE}
+# R version employed for this script is 4.2.0
+library(tidyr) # to manage data
+library(dplyr) # to manage data
+```
+
+## Load and prepare data
+
+```{r}
+# Directories
+ms_directory <- "/omics/groups/OE0436/data/jimenez/data/mutational_signatures/"
+
+# Example
+ex <- read.delim(paste0(ms_directory, "snvs_K28A-T3RZ93_metastasis1_somatic_snvs_conf_8_to_10.vcf.combinedSignatureNormExposures.tsv"))
+
+ex <- ex %>% mutate(Time = rep("pre-treatment", nrow(ex)), PID = rep(strsplit(strsplit("snvs_K28A-T3RZ93_metastasis1_somatic_snvs_conf_8_to_10.vcf.combinedSignatureNormExposures.tsv", "-")[[1]][2], "_")[[1]][1], nrow(ex)))
+
+# Function 
+read_ms <- function(directory, file){
+  f <- read.delim(paste0(directory, file)) # read file
+  
+  f <- f %>% mutate(Time = rep("post-treatment", nrow(f)), 
+                      PID = rep(strsplit(strsplit(file, "-")[[1]][2], "_")[[1]][1], nrow(f))) %>%
+                        as.data.frame() # assign PID and time of treatment
+}
+
+# Read all files
+ms_met1 <- list.files(path = ms_directory, pattern = "*metastasis1")
+ms_met2 <- list.files(path = ms_directory, pattern = "*metastasis2")
+
+ms_list <- lapply(ms_met2, function(x) read_ms(ms_directory, x)) 
+
+ms <- bind_rows(ms_list) # create a data frame containing all
+ms_post <- bind_rows(ms_list) # repeat all steps with met2 and "post-treatment" in function
+
+# Load pheno data
+pheno <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/PID_treatment.csv", 
+                  header = TRUE, sep = ";", row.names = "PID")
+colnames(pheno) = c("therapy", "evolution") 
+
+pheno <- pheno %>% 
+  mutate(response = ifelse(evolution == "PR", "responders", "non-responders"))
+
+# Add response to ms
+ms <- ms %>% mutate(Response = ifelse(PID %in% rownames(pheno)[pheno$response == "responders"], 
+                                      "responders", "non-responders"))
+
+ms_post <- ms_post %>% mutate(Response = ifelse(PID %in% rownames(pheno)[pheno$response == "responders"], 
+                                      "responders", "non-responders"))
+```
+
+
+## Boxplots
+
+Valid norm is the best take on it for exome data.
+
+Normalized_exposure 
+
+Barplot
+
+```{r}
+# Barplot
+ms_both <- rbind(ms, ms_post) %>% mutate(Signature = X)
+
+ggplot(transform(ms_both, Time = factor(Time, levels = c("pre-treatment", "post-treatment")),
+                 X = factor(X, levels = mixedsort(unique(ms_both$Signature)))), 
+       aes(x = PID, y = Valid_norm*100)) + 
+  geom_bar(aes(fill = Signature), stat = "identity", position = "stack") + 
+  ylab("% alterations related to signature") + 
+  xlab("Samples") +
+  facet_grid(~ Time ~ Response, scales = "free_x") +
+  theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                     strip.background = element_rect(fill = "white", color = "black"))
+
+# Boxplots
+# Pre-treatment
+shapiro.test(ms$Valid_norm) # not normal
+
+ggplot(transform(ms, Time = factor(Time, levels = c("pre-treatment", "post-treatment")), 
+                 X = factor(X, levels = mixedsort(unique(ms$X)))), 
+       aes(x = Response, y = Valid_norm*100)) + 
+  geom_boxplot(aes(fill = Response), alpha = 2) + geom_point() + 
+  scale_fill_manual(values = c("red", "green")) +
+  theme_bw() + ylab("% alterations related to signature") + 
+  xlab("Mutational signatures for metastasis1 samples (pre-treatment)") +
+  facet_wrap(~ X, scales = "free_y") +
+  theme(axis.text.x = element_blank(), 
+        strip.background = element_rect(fill = "white", color = "black"),
+        strip.text.x = element_text(size = 12)) + 
+  stat_compare_means(paired = FALSE, vjust = TRUE, size = 3, label.x = 1.25)
+
+# Post-treatment
+shapiro.test(ms_post$Valid_norm) # not normal
+
+ggplot(transform(ms_post, Time = factor(Time, levels = c("pre-treatment", "post-treatment")), 
+                 X = factor(X, levels = mixedsort(unique(ms_post$X)))), 
+       aes(x = Response, y = Valid_norm*100)) + 
+  geom_boxplot(aes(fill = Response), alpha = 2) + geom_point() + 
+  scale_fill_manual(values = c("red", "green")) +
+  theme_bw() + ylab("% alterations related to signature") + 
+  xlab("Mutational signatures for metastasis2 samples (post-treatment)") +
+  facet_wrap(~ X, scales = "free_y") +
+  theme(axis.text.x = element_blank(), 
+        strip.background = element_rect(fill = "white", color = "black"),
+        strip.text.x = element_text(size = 12)) + 
+  stat_compare_means(paired = FALSE, vjust = TRUE, size = 3, label.x = 1.25)
+
+```
+
+## References
+1. Gu, Z., Eils, R. & Schlesner, M. Complex heatmaps reveal patterns and correlations in multidimensional genomic data. Bioinformatics 32, 2847–2849 (2016).
+2. Alexandrov, L. B. et al. Signatures of mutation-al processes in human cancer. Nature 500, 415 (2013).
+3. Campbell, P. J. et al. Pan-cancer analysis of whole genomes. Nature vol. 578 82–93 Preprint at https://doi.org/10.1038/s41586-020-1969-6 (2020).

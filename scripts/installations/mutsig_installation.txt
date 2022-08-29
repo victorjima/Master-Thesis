@@ -1,0 +1,18 @@
+For mutsig usage, two modules are required: 
+module load mcr/9.0.1
+module load mutsig/1.41
+
+For information on its usage: 
+run_MutSigCV.sh
+
+Usage:
+/software/mutsig/1.41/bin/run_MutSigCV.sh <deployedMCRroot> args
+
+For its usage, a maf file is required, along with a coverage and covariates text. Both coverage and covariates are the ones provided by the software and may be found 
+at /omics/groups/OE0436/data/jimenez/data/MutSig
+
+I have not been able to run it. The usage requires an mcr path that I have not been able to ellucidate. And the same error always appears saying it cannot open a matlab library 
+(which could be related to the fact that the mcr root is not correctly specified)
+
+More information on installation and usage: 
+https://software.broadinstitute.org/cancer/cga/mutsig_run

@@ -1,0 +1,592 @@
+---
+title: <span style="font-family:Georgia;">Differential expression analysis in pre-treatment samples</span>
+author: "Víctor Jiménez Martínez"
+date: "2022"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Introduction
+
+The main goal of this differential expression analysis is to compare RNA-seq expression data between responder and non-responder patients and explore the differences in their gene expression. The analyses are performed with protein-coding genes. 
+
+## Libraries
+
+Libraries needed for the analyses are loaded below.
+
+```{r, results="hide", message=FALSE, warning=FALSE}
+library(edgeR)  # to build MA plots
+library(pheatmap)  # to build a heatmap
+library(stats)
+library(ggplot2)  # for visualization
+library(EDASeq)  # for RLE plots
+library(limma)  # for differential expression analysis
+library(DESeq2) # for differential expression analysis
+library(sva)  # for surrogate variable analysis
+library(EnhancedVolcano)  # for Volcano plot
+library(clusterProfiler)  # for enrichment analysis
+library(org.Hs.eg.db)  # Homo sapiens annotation
+library(OmicCircos)  # for circosPlot
+library(GWASTools) # for qqplot
+library(fgsea) # GSEA
+library(tibble) # to manage data
+library(simplifyEnrichment)
+```
+
+## Loading data
+
+First of all, data is loaded and set for the analyses.
+
+```{r}
+# MCPCounter results
+mcp <- read.delim("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/deconvolution/mcp_decon_immune_post.tsv")
+
+# Raw counts
+counts <- read.delim("/omics/groups/OE0436/data/jimenez/data/rnaseq/rnaseq_counts_met2_protein_coding.tsv")
+colnames(counts)[1:3] <- sapply(colnames(counts)[1:3], function(x) gsub("^X", "", x)) # adapt three first PIDs
+
+# Response to treatment information
+pheno <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/PID_treatment.csv", 
+                  header = TRUE, sep = ";", row.names = "PID")
+pheno <- pheno[colnames(counts), ] # order the same and filter for those samples we have in rnaseq
+```
+
+Set SD and PD as non-responders and PR as responders.
+
+```{r}
+colnames(pheno) = c("therapy", "evolution") # change names
+
+pheno <- pheno %>% 
+  mutate(response = ifelse(evolution == "PR", "responders", "non-responders"))
+```
+
+Finally, counts matrices are filtered to remove background transcriptomic noise and genes that are not expressed. First of all, all rows sums must be higher than 10 in order to ensure there is a minimal amount of counts per gene, and second of all, at least 80% of samples per condition must be different to 0 counts. 
+
+```{r}
+# Filter counts table to remove some background "noise"
+# Row sums must be higher than 10 in both groups in order to ensure there are enough counts
+# counts <- counts[rowSums(counts) >10, ]
+counts <- counts[rowSums(counts[,rownames(pheno)[pheno$response == "responders"]]) > 10 &
+                    rowSums(counts[,rownames(pheno)[pheno$response == "non-responders"]]) > 10, ]
+
+cat(dim(counts)[1], 
+    "genes with more than 10 counts in both groups")
+
+# Keep genes that have counts in at least 80% of each group
+# Compute number of samples per experimental group and minimum percent
+n.samplespergroup <- table(pheno$response) 
+percent <- 0.8 # define the 80%
+samples.min <- round(n.samplespergroup*(1-percent), 0) # number of samples that represents the 20%, the maximum amount of 0 allowed
+
+# Data frame with the number of 0 in each gene and sample
+df_0 <- data.frame(row.names = rownames(counts), 
+                   "non-responders" = rep(0, length(rownames(counts))), 
+                   "responders" = rep(0, length(rownames(counts))))
+for (i in 1:2){
+  c <- counts[ , which(colnames(counts) %in% rownames(pheno[pheno$response == unique(pheno$response)[i], ]))] # subset counts per group
+  how_many_0 <- apply(c, 1, function(x) sum(x == 0)) # compute how many 0 per gene
+  df_0[, i] <- as.vector(how_many_0)
+}
+
+# Get genes that have counts in at least 80% of the samples of at least one group
+resta <- apply(df_0, 1,  function(x) {any(x < as.vector(samples.min))}) # substract the 80% computed for each group to the counts found for each gene, if it is > 0 it means that at least 60% of samples counted that gene
+idx_80 <- rownames(counts)[which(resta == TRUE)]
+
+cat(length(idx_80), "out of", dim(counts)[1], 
+    "genes counted in 80% of the samples of at least one group")
+
+counts <- counts[idx_80, ]
+
+# Before applying DEseq2, normalized data will be checked to ensure normalization is accomplished in our set and continue with the analysis
+# TPM counts are loaded and the selected genes in counts are selected
+tpm <- read.delim("/omics/groups/OE0436/data/jimenez/data/rnaseq/rnaseq_tpm_met2_protein_coding.tsv")
+tpm <- tpm[rownames(counts), ]
+colnames(tpm)[1:3] <- sapply(colnames(tpm)[1:3], function(x) gsub("^X", "", x)) # adapt three first PIDs
+```
+
+When comparing responders vs. non-responders, estimation of immune cell population abundances through MCPCounter tool will be included as covariates. But, first of all, abundances will be normalized.
+
+```{r}
+# Z-score normalization
+zmcp <- (mcp[,-29] - apply(mcp[,-29], 1, mean)) / apply(mcp[,-29], 1, sd)
+
+# Check normalization with RLE
+plotRLE(as.matrix(t(mcp[,-29])), outline = FALSE, ylim = c(-2, 2), main = "post-treatment MCPCounter raw estimated relative abundance")
+plotRLE(as.matrix(t(zmcp)), outline = FALSE, ylim = c(-2, 2), main = "post-treatment MCPCounter z-score estimated relative abundance")
+plotRLE(as.matrix(log2(mcp[,-29])), outline = FALSE, ylim = c(-2, 2), main = "Log2")
+
+# While log2 normalization seems to have less dispersion, zcount scores reduce sd and mean in the variables, which makes it a better option for fiting the variables into GLM regressions in DESeq2
+
+# Including the es of populations in pheno for further analysis
+pheno <- cbind(pheno, zmcp)
+
+# Fixing therapy information
+pheno$therapy[pheno$therapy == "Pembro + T-VEC"] = "Pembro + TVEC"
+pheno$therapy[pheno$therapy == "Ipi/Nivo "] = "Ipi/Nivo"
+pheno$therapy[pheno$therapy == "Pembro + TVEC"] = "Pembro_and_TVEC"
+pheno$therapy[pheno$therapy == "Ipi/Nivo"] = "Ipi_Nivo"
+
+# Adding batch information
+pheno$batch <- as.factor(c(1, 1, 1, 2, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 1))
+```
+
+## Quality control and normalization
+
+To perform a differential expression analysis, we must check normalized data and its variation. Even though DEseq2 requires raw counts, it performs a normalization during its process. 
+
+Distribution of normalized counts can be checked. Assuming that, between two individuals, most genes are not differentially expressed, the difference of log-ratios between individuals should be centered at 0 when correctly normalized
+
+```{r}
+MbyTPM <- log2(tpm[, 1] - tpm[, 3])
+
+hist(as.numeric(MbyTPM), xlab = "log2-ratio", main = "post-treatment TPM differences between 2 samples")
+abline(v = 0, col = "red")
+```
+
+To further check if data is correctly normalized a MA-plot. The plot visualizes the differences between measurements taken in two samples, by transforming the data onto M (log ratio) and A (mean average) scales, then plotting these values. That is, it represents the difference of count log-rations between individuals against the mean of those log-ratios.The red line would show the expected values.
+
+```{r}
+maPlot(tpm[, 1], tpm[, 2], 
+       pch = 19, cex = 0.5, ylim = c(-8, 8), 
+       allCol = "darkgray", lowess = TRUE, 
+       xlab = expression(A == log[2](sqrt(Sample1 %.% Sample2))), 
+       ylab = expression(M == log[2](Sample1/Sample2)))
+grid(col = "black")
+title("MA plot of TPM differences between 2 samples")
+```
+
+Finally, dispertion can be checked with RLE (Relative Log Expression) plots. RLE plots are a tool for visualizing unwanted variation in high dimensional data, showing the dispersion of the samples.
+
+```{r}
+par(mfrow = c(2, 1))
+
+plotRLE(as.matrix(counts), outline = FALSE, ylim = c(-2, 2), main = "RLE of post-treatment raw counts")
+
+plotRLE(as.matrix(tpm), outline = FALSE, ylim = c(-2, 2), main = "RLE of post-treatment TPM")
+```
+
+## Exploratory analysis
+
+A heatmap and a PCA are performed to check how the samples cluster according to their response.
+
+### Clustering through heatmap
+
+For clustering of data, a heatmap is built. That way, similarity between individuals according to quantified expression is addressed. To save resources and time, only most variable genes are used for the heatmap.
+
+```{r}
+# Selection of top 100 most variable genes Compute the variance of each gene across
+# samples
+V <- apply(tpm, 1, var)
+
+# Results are sorted by variance in decreasing order and top 100 genes are selected
+selectedGenes <- names(V[order(V, decreasing = T)][1:100])
+
+# Heatmap
+pheatmap(tpm[selectedGenes, ], scale = "row", annotation_col = pheno[,c(2,3,32)], 
+         show_rownames = FALSE, show_colnames = FALSE, 
+         annotation_legend = T, annotation_names_col = F)
+```
+
+They do not seem to cluster
+
+### PCA
+A PCA is performed to see the distribution of individuals according to response to treatment and check again if any clustering can be seen.
+
+```{r}
+# Compute PCA
+pca_data <- prcomp(t(tpm), retx=TRUE, center=TRUE, scale=FALSE)
+summary(pca_data)$importance[,c(1,2)]
+
+# Scores data
+scores <- as.data.frame(pca_data$x[, c("PC1", "PC2")]) # loading coeficients
+scores$Response <- pheno$response # response to treatment 
+scores$batch <- pheno$batch
+
+# Plot
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/DEA/protein_coding_genes/PCA_expression_tpm_protein_coding.pdf")
+
+scores.plot <- ggplot(data = scores, 
+                      aes(x = PC1, 
+                          y = PC2, 
+                          colour = Response, 
+                          label = rownames(scores))) + 
+  geom_point(alpha = I(0.7), size = 4) + 
+  geom_hline(yintercept = 0)+
+  geom_vline(xintercept = 0)+
+  xlab(paste0("PC1 (", round(summary(pca_data)$importance[2,1], 2) * 100, "%)"))+
+  ylab(paste0("PC2 (", round(summary(pca_data)$importance[2,2], 2) * 100, "%)"))+
+  stat_ellipse() + scale_color_manual(values = c("red", "green")) +
+  theme_bw() + ggtitle("PCA with expression data (TPM) in post-treatment samples")
+
+scores.plot
+
+dev.off()
+```
+
+They do not cluster.
+
+## Accounting for unwanted variability 
+
+Once data is loaded and checked, Differential Expression Analysis may be performed. However, it is important to take into account unwanted variability that may biass the results and inflate the p-values. P-values are expected to follow a uniform distribution. Extra variability may inflate p-values and give more significanies than we should have (false positives). Thus, a first iteration of the DEseq2^1^ is performed to check on p-value distribution and if there needs to be correction due to inflation.
+
+The covariates that will be used for the analyses will include the therapies and the estimated abundance of a set of immune cells. These populations are selected from the results of MCPCounter deconvolution and are the ones that showed significant differences in post-treatment samples, considering they change during the treatment. These populations are: Activated CD4 T cell, Activated CD8 T cell, Central Memory CD8 T cell, Effector Memory CD8 T cell, Macrophage, Immature B cell, Mast cell, Natural Killer cell, Regulatory T cell, T follicular helper cell, Type 1 T helper cell. According to the results commented in *deconvolotuion.Rmd*, it would seem that CD8+ populations could constitute a potential biomarker for response to immune checkpoint treatment, something partially supported by the change during treatment. In that sense, the abundance of these populations will be included as covariates for the differential expression analysis. 
+
+
+```{r}
+# Create a DESeq dataset object from the count matrix and the colData
+# All the variables in pheno are included
+designFormula <- as.formula(~ therapy + response + batch + Activated.CD8.T.cell + 
+                              Central.memory.CD8.T.cell  + Effector.memeory.CD8.T.cell) 
+                            
+dds <- DESeqDataSetFromMatrix(countData = round(counts),
+                              colData = pheno, 
+                              design = designFormula)
+
+# We can use the DESeq () function of DESeq2 , which is a wrapper function that
+# implements estimation of size factors to normalize the counts, estimation of dispersion values,
+# and computing a GLM model based on the experimental design formula
+dds <- DESeq(dds)
+# dds <- nbinomWaldTest(dds, maxit = 300) 
+# 40 genes do not converge, might be because they bear low counts and the filter did not get rid off them
+
+# Compare and contrast the samples based on different variables of interest
+DEresults <- results(dds, contrast = c("response", 'responders', 'non-responders'))
+DEresults <- DEresults[order(DEresults$pvalue),]
+
+# p-value distribution
+ggplot(data = as.data.frame(DEresults), aes(x = pvalue)) +
+  geom_histogram(bins = 100) + theme_bw()
+
+# qq-plots
+par(mfrow = c(1, 2))
+GWASTools::qqPlot(DEresults$pvalue, main = "qq-plot with p-values")
+GWASTools::qqPlot(DEresults$padj, main = "qq-plot with adjusted p-values")
+```
+
+### SVA
+The qq-plot shows the expected distribution of p-values vs. the actual distribution obtained. We can see our p-values are a little bit inflated. Thus, a SVA analysis to catch extra variability to adjust to is performed. 
+
+Surrogate Variable Analysis (SVA)^2^ was performed with sva R package to account for unwanted existing variability (except the one driven by our condition) and adjust for it in the DESeq2 model. By defining two models, the method esti-mates artificial surrogate variables from raw counts that were then included in the DESeq2 design matrix. 
+
+```{r}
+mod1 <- model.matrix( ~ therapy + response + batch + Activated.CD8.T.cell + 
+                              Central.memory.CD8.T.cell  + Effector.memeory.CD8.T.cell, 
+                      data = pheno)
+
+                  
+mod0 <- model.matrix( ~ therapy + batch + Activated.CD8.T.cell + 
+                              Central.memory.CD8.T.cell  + Effector.memeory.CD8.T.cell, 
+                      data = pheno) # model with all the covariates but the one of interest (response)
+
+
+# Then, the surrogate variables are estimated with
+sv <- svaseq(as.matrix(counts), mod1, mod0)
+
+# We include these surrogate variables in the pheno data frame
+for (i in 1:3){
+  pheno[,32+i] <- sv$sv[,i]
+}
+colnames(pheno)[33:35] <- c("sv1", "sv2", "sv3")
+```
+
+Let's try again.
+
+```{r}
+# Create a DESeq dataset object from the count matrix and the colData
+# All the variables in pheno are included
+designFormula <- as.formula(~ therapy + response + batch + Activated.CD8.T.cell + 
+                              Central.memory.CD8.T.cell  + Effector.memeory.CD8.T.cell +
+                              sv1 + sv2 + sv3 ) 
+                            
+dds_sv <- DESeqDataSetFromMatrix(countData = round(counts),
+                              colData = pheno, 
+                              design = designFormula)
+
+# We can use the DESeq () function of DESeq2 , which is a wrapper function that
+# implements estimation of size factors to normalize the counts, estimation of dispersion values,
+# and computing a GLM model based on the experimental design formula
+dds_sv <- DESeq(dds_sv)
+
+# dds_sv <- nbinomWaldTest(dds_sv, maxit = 741) # to converge all genes I increase the number of iterations
+
+# 64 genes do not converge
+
+# Compare and contrast the samples based on different variables of interest
+DEresults_sv <- results(dds_sv, contrast = c("response", 'responders', 'non-responders'))
+DEresults_sv <- DEresults_sv[order(DEresults_sv$pvalue),]
+
+# p-value distribution
+ggplot(data = as.data.frame(DEresults_sv), aes(x = pvalue)) +
+  geom_histogram(bins = 100) + theme_bw()
+
+# qq-plots
+par(mfrow = c(1, 2))
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/DEA/protein_coding_genes/p-value_distribution_DEA_SV_pre.pdf")
+
+GWASTools::qqPlot(DEresults_sv$pvalue, main = "qq-plot with p-values after SVA")
+
+dev.off()
+
+GWASTools::qqPlot(DEresults_sv$padj, main = "qq-plot with adjusted p-values")
+
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/DEA/protein_coding_genes/p-value_distribution_DEA_SV_pre.pdf")
+
+ggplot(data = as.data.frame(DEresults_sv), aes(x = pvalue)) +
+  geom_histogram(bins = 100)
+GWASTools::qqPlot(DEresults_sv$pvalue, main = "qq-plot with p-values")
+
+dev.off()
+```
+
+SVA does not get rid off all the inflation but exaggerates the peak in the left of the distribution. To catch those values, then, I use SVA results. 
+
+## Differential expression analysis
+
+```{r}
+# Exploring the top DEG
+# Top differentially expressed genes
+DEresults_sv <- DEresults_sv[rowSums(is.na(DEresults_sv)) == 0, ] # remove NA rows
+top <- DEresults_sv[DEresults_sv$padj < 0.05, ] # 306 differentially expressed genes
+
+# Save table
+write.table(top, file = "/omics/groups/OE0436/data/jimenez/outputs/rnaseq/DEA/protein_coding_genes/post/DEG_protein_coding_post.tsv", sep = "\t", col.names = TRUE, row.names = TRUE)
+
+
+# Normalized counts from differentially expressed genes
+dif <- tpm[rownames(top), ]
+
+# Heatmap
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/DEA/protein_coding_genes/heatmap_DEG_protein_coding_pre.pdf")
+
+pheatmap(as.matrix(dif[,order(pheno$response)]), scale = "row", 
+         annotation_col = data.frame(row.names = rownames(pheno)[order(pheno$response)], 
+                                     "Response" = pheno$response[order(pheno$response)]),
+         annotation_colors = list(Response= c(`non-responders` = "red", responders= "green")),
+         show_rownames = FALSE, show_colnames = TRUE, # legend_labels = c("Scaled expression"),
+         cluster_cols = FALSE, annotation_legend = T, annotation_names_col = F,
+         name = "Scaled Expression (TPM)")
+
+dev.off() 
+
+# Volcano plot
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/DEA/protein_coding_genes/volcano_plot_protein_coding_pre.pdf")
+
+EnhancedVolcano(DEresults_sv, lab = rownames(DEresults_sv), x = "log2FoldChange", y = "padj",
+                pCutoff = 0.05, FCcutoff = 1, 
+                # selectLab =  rownames(comparison),
+                title = "Volcano plot", 
+                subtitle = "post-treatment responders vs nonresponders differential expression analysis",
+                legendLabSize = 10, legendIconSize = 3, legendPosition = "right", labSize = 3)
+                #legendLabels=c('Not sig.','Log (base 2) FC','p-value', 'p-value & Log (base 2) FC'))
+
+dev.off()
+
+# PCA
+# Compute PCA
+pca_data <- prcomp(t(dif), retx=TRUE, center=TRUE, scale=FALSE)
+summary(pca_data)$importance[,c(1,2)]
+
+# Scores data
+scores <- as.data.frame(pca_data$x[, c("PC1", "PC2")]) # loading coeficients
+scores$Response <- pheno$response # response to treatment 
+scores$batch <- pheno$batch
+
+# Plot
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/DEA/protein_coding_genes/PCA_deg_pre_protein_coding.pdf")
+
+scores.plot <- ggplot(data = scores, 
+                      aes(x = PC1, 
+                          y = PC2, 
+                          colour = Response, 
+                          label = rownames(scores))) + 
+  geom_point(alpha = I(0.7), size = 4) + 
+  geom_hline(yintercept = 0)+
+  geom_vline(xintercept = 0)+
+  xlab(paste0("PC1 (", round(summary(pca_data)$importance[2,1], 2) * 100, "%)"))+
+  ylab(paste0("PC2 (", round(summary(pca_data)$importance[2,2], 2) * 100, "%)"))+
+  stat_ellipse() + scale_color_manual(values = c("red", "green")) +
+  theme_bw() + ggtitle("PCA with post-treatment differentially expressed genes expression (TPM)")
+
+scores.plot
+
+dev.off()
+
+```
+
+With the results, we can proceed with GSEA and enrichment analyses. 
+
+## Functional analyses
+
+Enrichment analysis is performed to identify over-represented gene ontologies (GO^3^ Database) and pathways (KEGG^4^ database) in responders and non-responders from their differential expressed genes (adjusted p-value < 0.05). For that purpose, clusterProfiler^5^ R package was implemented, which conducts enrichment tests based on hypergeometric distribution and adjusts p-values and computes q-values. 
+
+### Enrichment
+
+```{r}
+# Subset for upregulation according to condition (the contrast was responders vs nonresponders)
+responders_up <- top[top$log2FoldChange > 0, ]
+nonresponders_up <- top[top$log2FoldChange < 0, ]
+
+# Obtain genes 
+deGenes <- rownames(top)
+deGenes_responders <- rownames(responders_up)
+deGenes_non <- rownames(nonresponders_up)
+
+# Obtain EntrezID of deg
+deGenes <- bitr(deGenes, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+deGenes_responders <- bitr(deGenes_responders, fromType="SYMBOL", 
+                           toType="ENTREZID", OrgDb="org.Hs.eg.db")
+deGenes_non <- bitr(deGenes_non, fromType="SYMBOL", 
+                    toType="ENTREZID", OrgDb="org.Hs.eg.db")
+
+# Given our list, the function searches for human Biological Processes associated in GO and KEGG
+# with an adjusted p-value cut-off 
+# ego_top <- enrichGO(gene = deGenes$ENTREZID, 
+#                     ont = "BP", 
+#                     keyType = "ENTREZID",
+#                     OrgDb = "org.Hs.eg.db", 
+#                     readable = TRUE, 
+#                     pvalueCutoff = 0.05)
+# 
+# ek_top <- enrichKEGG(gene = deGenes$ENTREZID,
+#                      pvalueCutoff = 0.5,
+#                      qvalueCutoff = 0.5,
+#                      organism = "hsa")
+# 
+# enrichplot::dotplot(ego_top, title = "GO responders vs non-responders differentially expressed genes", showCategory = 10)
+# enrichplot::dotplot(ek_top, title = "KEGG responders vs non-responders differentially expressed genes", showCategory = 10)
+
+ego_responders <- enrichGO(gene = deGenes_responders$ENTREZID, 
+                   ont = "BP", 
+                   keyType = "ENTREZID",
+                   OrgDb = "org.Hs.eg.db", 
+                   readable = TRUE, 
+                   pvalueCutoff = 0.2)
+
+ek_responders <- enrichKEGG(gene = deGenes_responders$ENTREZID,
+                    pvalueCutoff = 0.5,
+                    qvalueCutoff = 0.5,
+                    organism = "hsa")
+
+ego_non <- enrichGO(gene = deGenes_non$ENTREZID, 
+                   ont = "BP", 
+                   keyType = "ENTREZID",
+                   OrgDb = "org.Hs.eg.db", 
+                   readable = TRUE, 
+                   pvalueCutoff = 0.2)
+
+ek_non <- enrichKEGG(gene = deGenes_non$ENTREZID,
+                    pvalueCutoff = 0.5,
+                    qvalueCutoff = 0.5,
+                    organism = "hsa")
+
+# Table with all of them
+ego_responders@result$Response <- "responders"
+ego_responders@result$Type <- "GO term" 
+
+ego_non@result$Response <- "non-responders"
+ego_non@result$Type <- "GO term" 
+
+ek_responders@result$Response <- "responders"
+ek_responders@result$Type <- "KEGG pathway" 
+
+ek_non@result$Response <- "non-responders"
+ek_non@result$Type <- "KEGG pathway" 
+
+enrichment <- rbind(ego_responders@result, ego_non@result, ek_responders@result, ek_non@result)
+
+write.table(enrichment, 
+            file = "/omics/groups/OE0436/data/jimenez/outputs/rnaseq/DEA/protein_coding_genes/enrichment/deg_enrichment_post.csv", quote = FALSE, sep = ",", row.names = TRUE, col.names = TRUE)
+
+
+# Some exploration
+ego_responders@result[ego_responders@result$p.adjust < 0.1, ] 
+
+ek_responders@result[ek_responders@result$p.adjust < 0.2, ] # No terms associated under 0.23...
+
+ego_non@result[ego_non@result$p.adjust < 0.05, ] # 10 terms associated
+
+ek_non@result[ek_non@result$p.adjust < 0.1, ] # No terms associated under 0.83...
+
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/DEA/protein_coding_genes/enrichment/dotplots_enrichment_pre_protein_coding_genes.pdf")
+
+enrichplot::dotplot(ego_responders, title = "GO terms enriched in responders significantly upregulated genes", showCategory = 10)
+
+enrichplot::dotplot(ek_responders, title = "KEGG pathways enriched in responders significantly upregulated genes", showCategory = 10)
+
+enrichplot::dotplot(ego_non, title = "GO terms enriched in non-responders significantly upregulated genes", showCategory = 10)
+
+enrichplot::dotplot(ek_non, title = "KEGG pathways enriched in non-responders significantly upregulated genes", showCategory = 10)
+
+dev.off()
+```
+
+## Further exploration
+
+According to paper :
+"We reasoned that the immunogenicity of the tumor can be represented by the cytolytic activity  (estimated using the expression of granzyme A (GZMA) and perforin (PRF1) according to Rooney et al., 2015), because this is the ultimate effector mechanism in the cancer immunity cycle"
+
+```{r}
+DEresults_sv["GZMA", ] # it's not significantly different
+DEresults_sv["PRF1", ] # it's not significantly different
+DEresults_sv["CD274", ] # PD-L1 gene is not significantly different
+DEresults_sv["HLA-A", ] # it's not significantly different
+DEresults_sv[grep("HLA", rownames(DEresults_sv)), ] # no
+DEresults_sv["TNF", ] # it's not significantly different
+DEresults_sv["IFNG", ] # it's not significantly different
+DEresults_sv[grep("CXCL", rownames(DEresults_sv)), ] # a bunch of them
+DEresults_sv[grep("IL", rownames(DEresults_sv)), ] # IL1RAPL1 is significant
+DEresults_sv[grep("SOCS", rownames(DEresults_sv)), ] # none of them are significantly different
+DEresults_sv["TCF7", ] # it's not significantly different
+
+# Interesting genes
+int_genes <- c("GZMA", "PRF1", "CD274", "TNF", "IFNG", "CTLA4")
+tpm_int <- tpm[int_genes, ] %>% mutate(GENE = int_genes)
+rownames(tpm_int) <- 1:nrow(tpm_int)
+
+tpm_int <- pivot_longer(tpm_int, cols = colnames(tpm), names_to = "PID", values_to = "Expression") %>%
+  mutate(Response = ifelse(PID %in% rownames(pheno)[pheno$response == "responders"], "responders",
+                           "non-responders"))
+
+
+ggplot(tpm_int, 
+       aes(x = Response, y = Expression)) + 
+  geom_boxplot(aes(fill = Response), alpha = 2) + geom_point() + 
+  scale_fill_manual(values = c("red", "green")) +
+  theme_bw() + ylab("TPM expression values") + 
+  xlab("Expression of known biomarkers for metastasis2 samples (post-treatment)") +
+  facet_wrap(~ GENE, scales = "free_y") +
+  theme(axis.text.x = element_blank(), 
+        strip.background = element_rect(fill = "white", color = "black"),
+        strip.text.x = element_text(size = 12)) + 
+  stat_compare_means(method = "t.test", paired = FALSE, vjust = TRUE, size = 3, label.x = 1.25)
+
+
+
+# EnhancedVolcano(DEresults_combat, lab = rownames(DEresults_combat), x = "log2FoldChange", y = "padj",
+#                 pCutoff = 0.05, FCcutoff = 10, 
+#                 selectLab = c("GZMA", "PRF1", "CD274", "IFNG", "TNF", "CXCL3", "IL-17", "TCF7"),
+#                 title = "Volcano plot", 
+#                 subtitle = "responders vs nonresponders differential expression analysis",
+#                 legendLabSize = 10, legendIconSize = 3, legendPosition = "right", labSize = 3,
+#                 parseLabels = TRUE)
+#                 #legendLabels=c('Not sig.','Log (base 2) FC','p-value', 'p-value & Log (base 2) FC'))
+
+```
+
+
+## Bibliography
+1. Love, M. I., Huber, W. & Anders, S. Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2. Genome Biol 15, 1–21 (2014).
+2. Leek, J. T. & Storey, J. D. Capturing Heteroge-neity in Gene Expression Studies by Surrogate Variable Analysis. PLoS Genet 3, e161 (2007).
+3. Gene Ontology Consortium, T. et al. Gene On-tology: tool for the unification of biology NIH Public Access Author Manuscript. Nat Genet 25, 25–29 (2000).
+4. Kanehisa, M., Goto, S., Furumichi, M., Tanabe, M. & Hirakawa, M. KEGG for representation and analysis of molecular networks involving diseases and drugs. doi:10.1093/nar/gkp896.
+5. Yu, G., Wang, L.-G., Han, Y. & He, Q.-Y. clus-terProfiler: an R Package for Comparing Bio-logical Themes Among Gene Clusters. doi:10.1089/omi.2011.0118.
+
+
+
+
+
+
+
+

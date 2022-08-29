@@ -1,0 +1,43 @@
+##### HOW TO RUN MUTSCAPE #####
+
+# Go to folder where the software is
+cd ./omics/groups/OE0436/data/jimenez/tools/MutScape/MutScape/mutscape
+
+# Load miniconda module 
+module load miniconda/4.9.2
+
+# Initialize conda 
+conda init
+
+# Activate conda environment 
+bash
+conda activate /omics/groups/OE0436/data/jimenez/tools/MutScape/MutScape/mutscape
+
+# And if not, create one: 
+conda create -p path/to/environment
+
+# MutScape has several tools that allow to carry out different analyses and obtain different outputs
+# To obtain a list of the significantly mutated genes:
+# Noteworthy to point that this analysis generates first two .txt files (oncodriveCLUST.nonsyn.txt and oncodriveCLUST.syn.txt) that serve as input for the oncodrive tool, which 
+# computes the significance. The output with the list of genes and their significance is generated in an oncodriveclust_results.tsv
+python3 mafAnalysis.py -f /omics/groups/OE0436/data/jimenez/data/snv.maf -smg -o /omics/groups/OE0436/data/jimenez/outputs -p /omics/groups/OE0436/data/jimenez/outputs
+
+# Another tool is to get known cancer gene annotation. It generates another maf file (kcga.output.maf) that adds some annotation information on the genes
+python3 mafAnalysis.py -f /omics/groups/OE0436/data/jimenez/data/snv.maf -kcga -o /omics/groups/OE0436/data/jimenez/outputs -p /omics/groups/OE0436/data/jimenez/outputs
+
+# MutScape can also compute Tumor Burden Statistics. This tool generates two files. In TMB_analysis.tsv we get an analysis per sample, which shows the total number of mutations, 
+# nonsynonymous mutations and the TMB estimation. In the TMB_statistics.tsv, we get general statistics parameters (mean, median...) for TMB and mutations
+python3 mafAnalysis.py -f /omics/groups/OE0436/data/jimenez/data/snv.maf -tmb 60456963 -o /omics/groups/OE0436/data/jimenez/outputs -p /omics/groups/OE0436/data/jimenez/outputs
+
+# As for the CoMut plot tool, it requires two commands, the first one generating two files required to build the plot. However, the second command requires more data, among which
+# files on CNA per sample, purity... are needed. For the moment, I have not used it
+
+# For the mutational signature tool, there is a column required "flanking_bps" that I don't know what information requires
+
+
+# If ModuleNotFoundError pops up due to lack of a Python module, try to install with command pip install name_of_package
+
+
+# When starting from vcf files, a preprocessing to convert it to maf files can be performed through dataPreprocess.py, but it requires vcf2maf tool, which I have not been able to install
+
+

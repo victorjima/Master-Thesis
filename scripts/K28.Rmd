@@ -1,0 +1,155 @@
+---
+title: <span style="font-family:Georgia;">K28 cohort summary</span>
+author: "Víctor Jiménez Martínez"
+date: "2022"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Introduction
+
+The main goal of this script is to obtain a plot summarizing available data for K28 cohort. 
+
+## Libraries
+
+Libraries needed for the script are loaded below.
+
+```{r, results="hide", message=FALSE, warning=FALSE}
+# R version employed for this script is 4.2.0
+library(tidyr) # to manage data
+library(dplyr) # to manage data
+library(RColorBrewer) # for colour
+library(ComplexHeatmap) # oncoprint
+```
+
+## Upload data
+
+```{r}
+# Read WES data
+exome <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/QC/WES_Alignment_Quality_Control-hipo_K28A_2022-7-26.csv", 
+                  header = TRUE, sep = ",")
+
+exome$PID <- unlist(lapply(strsplit(exome$Patient.ID, "-"), function(x) x[2]))
+
+# Filter data and prepare matrix
+exome <- exome %>% dplyr::select(Sample.Type, PID) %>% mutate(n = rep(1, nrow(exome))) %>%
+  filter(Sample.Type == "metastasis1" | Sample.Type == "metastasis2" | Sample.Type == "metastasis3" |
+           Sample.Type == "metastasis4") %>% 
+  pivot_wider(names_from = Sample.Type, values_from = n) %>%
+  replace(is.na(.), 0) %>% as.data.frame()
+
+rownames(exome) <- exome$PID
+exome <- exome[,-1]
+
+
+# Read RNA-seq data
+RNA <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/QC/RNA_Alignment_Quality_Control-hipo_K28A_2022-7-26.csv", 
+                  header = TRUE, sep = ",")
+
+RNA$PID <- unlist(lapply(strsplit(RNA$Patient.ID, "-"), function(x) x[2]))
+
+# Filter data and prepare matrix
+RNA <- RNA %>% dplyr::select(Sample.Type, PID) %>% mutate(n = rep(1, nrow(RNA))) %>%
+  filter(Sample.Type == "metastasis1" | Sample.Type == "metastasis2" | Sample.Type == "metastasis3" |
+           Sample.Type == "metastasis4") %>% 
+  pivot_wider(names_from = Sample.Type, values_from = n) %>%
+  replace(is.na(.), 0) %>% as.data.frame()
+  
+rownames(RNA) <- RNA$PID
+RNA <- RNA[,-1]
+RNA <- RNA[rownames(exome), c(2,1,3,4)] # order as the exome data frame
+
+# Create a list of matrix
+wes_rna <- list("WES" = as.matrix(exome), "RNAseq" = as.matrix(RNA))
+
+# Load pheno data
+pheno <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/PID_treatment.csv", 
+                  header = TRUE, sep = ";", row.names = "PID")
+colnames(pheno) = c("Therapy", "Outcome") # change names
+
+pheno <- pheno %>% 
+  mutate(Response = ifelse(Outcome == "PR", "responders", "non-responders"))
+
+# Fixing therapy information
+pheno$Therapy[pheno$Therapy == "Pembro + T-VEC" | pheno$Therapy == "Pembro + TVEC"] = "Pembrolizumab + Talimogen laherparepvec"
+pheno$Therapy[pheno$Therapy == "Ipi/Nivo " | pheno$Therapy == "Ipi/Nivo"] = "Ipilimumab/Nivolumab"
+pheno$Therapy[pheno$Therapy == "Pembro"] = "Pembrolizumab"
+pheno$Therapy[pheno$Therapy == "Ipi"] = "Ipilimumab"
+pheno$Therapy[pheno$Therapy == "Nivo "] = "Nivolumab"
+
+# Order according to group
+pids <- rownames(wes_rna[[1]])
+
+pheno <- pheno[pids, ]
+
+group <- pheno$Response
+outcome <- pheno$Outcome
+therapy <- pheno$Therapy
+                     
+order_column <- order(group)
+
+# Colors
+colors_data <- c(RNAseq = "orange", WES = "blue")
+
+# Time 
+time <- c("post-treatment", "pre-treatment", "post-treatment", "post-treatment")
+
+
+# Create plot
+pdf("/omics/groups/OE0436/data/jimenez/data/K28_summary.pdf")
+
+set.seed(123) # for generation of colors 
+oncoPrint(wes_rna, row_order = order_column, column_order = c(2,1,4,3), col = colors_data, 
+          row_title = "K28A cohort patients",
+          row_names_side = "left",
+          row_title_gp = gpar(fontsize = 12),
+          pct_side = "right",
+          
+          column_title = "Biopsies",
+          show_column_names = TRUE, 
+          column_names_gp = gpar(fontsize = 11),
+          column_names_side = "top",
+          column_title_side = "bottom",
+          column_names_rot = 45,
+          column_title_gp = gpar(fontsize = 12),
+        
+          top_annotation = columnAnnotation(Time = time,
+                                              col = list(Time = c(`pre-treatment` = "khaki1",
+                                                                  `post-treatment` = "khaki4")),
+                                             show_annotation_name = FALSE),
+          right_annotation = NULL,
+          left_annotation = rowAnnotation(Response = group,
+                                          Outcome = outcome, 
+                                          Therapy = therapy,
+                                          col = list(Response = c(
+                                            responders = "green",
+                                            `non-responders` = "red"),
+                                            Outcome = c(
+                                            PR = "dark green",
+                                            SD = "darksalmon", 
+                                            PD = "darkred")),
+                                          show_annotation_name = FALSE),
+          
+          heatmap_legend_param = list(title = "Data available", at = c("WES", "RNAseq")),
+          
+          alter_fun = list(
+  background = function(x, y, w, h) grid.rect(x, y, w, h, gp = gpar(fill = NA)),
+  
+  WES = function(x, y, w, h) {
+    grid.polygon(
+      unit.c(x + 0.5*w, x + 0.5*w, x - 0.5*w), 
+      unit.c(y + 0.5*h, y - 0.5*h, y + 0.5*h),
+      gp = gpar(fill = colors_data["WES"]))},
+  
+  RNAseq = function(x, y, w, h) {
+  grid.polygon(
+      unit.c(x - 0.5*w, x - 0.5*w, x + 0.5*w), 
+      unit.c(y - 0.5*h, y + 0.5*h, y - 0.5*h),
+      gp = gpar(fill = colors_data["RNAseq"]))}
+) 
+)
+
+dev.off()
+```

@@ -1,0 +1,28 @@
+Hello,
+
+This is a repository containing my scripts used for all the analyses performed for my Master Thesis in the context of the MSc Omics Data Analysis (2021-2022), 
+and conducted in the Division of Applied Bioinformatics at the German Cancer Research Center (Heidelberg). 
+
+A summary of the scripts:
+
+- K28.Rmd: obtains a figure with information on available data for all patients
+- merge_vcf.Rmd: merges .vcf files of individual patients and obtain a single .vcf file containing more than one sample
+- vcf_to_maf.Rmd: transforms the .vcf files obtained by the DKFZ pipeline into .maf format files
+- merge_counts.Rmd: transforms available expression data output by the DKFZ format to counts/tpm matrices ready for analysis
+- merge_cnv.Rmd: transforms available CNA data to TCN matrices
+- oncoprint_karyogram.Rmd: obtains oncoprints and karyograms to depict mutational landscape
+- significant_genes_mutscape.Rmd: analyses MutScape results and performs enrichment 
+- somatic_mutations.Rmd: describes mutational landscape, analysis on TMB and tries to look at lost mutations
+- mutation_signatures.Rmd: analysis of mutation signatures results 
+- immune_ssGSEA.Rmd: single sample GSEA with expression data to obtain enrichment of immune cell populations
+- deconvolution.Rmd: MCPCounter deconvolution analysis
+- immune_deconvolution.Rmd: ESTIMATE algorithm analysis and installation of immunedeconv package
+- rnaseq_DEA.Rmd: differential expression analysis of pre-treatment samples with DESeq2
+- rnaseq_DEA.Rmd: differential expression analysis of pre-treatment samples with DESeq2
+- integration.Rmd: integration of expression, deconvolution and mutation data with DIABLO
+- integration_cna_expression.Rmd: integration of expression and CNA data with DIABLO
+- regression.Rmd: construction of linear regression models with caret package and glm
+- installations folder: contains instructions on how to install some softwares
+- how_to_run folder: contains instructions on how to use some softwares
+
+Víctor Jiménez Martínez

@@ -1,0 +1,102 @@
+---
+title: <span style="font-family:Georgia;">Preparation of vcd files</span>
+author: "Víctor Jiménez Martínez"
+date: "2022"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Introduction
+
+The main goal of this script is to merge and obtain .tsv files vcf-like with SNV and indel information.
+
+## Libraries
+
+Libraries needed for the script are loaded below.
+
+```{r, results="hide", message=FALSE, warning=FALSE}
+# R version employed for this script is 4.2.0
+library(tidyr) # to manage data
+library(dplyr) # to manage data
+```
+
+## Exploring vcf files
+
+```{r}
+# Directories
+snv_directory <- "/omics/groups/OE0436/internal/eugenie/data/k28a/exon_sequencing/snv/somatic_functional_snvs/"
+indel_directory <- "/omics/groups/OE0436/internal/eugenie/data/k28a/exon_sequencing/indel/somatic_functional_indels/"
+
+# Example
+ex <- read.delim(paste0(indel_directory, "indel_K28A-17FFLM_somatic_functional_indels_conf_8_to_10.vcf"))
+ex <- read.delim(paste0(snv_directory, "snvs_K28A-17FFLM_somatic_functional_snvs_conf_8_to_10.vcf"))
+
+# Read all files
+vcf_snv <- list.files(path = snv_directory, pattern = "*metastasis2")
+vcf_indel <- list.files(path = indel_directory, pattern = "*metastasis2")
+
+snv_list <- lapply(paste0(snv_directory, vcf_snv), read.delim)
+indel_list <- lapply(paste0(indel_directory, vcf_indel), read.delim)
+```
+
+
+## Create vcf files with merged individuals 
+
+```{r}
+# Catch IDs
+PID_snv <- unlist(lapply(vcf_snv, function(x) lapply(strsplit(x, "_")[[1]][[2]], 
+                                                     function(y) strsplit(y, "-")[[1]][[2]])))
+
+PID_indel <- unlist(lapply(vcf_indel, function(x) lapply(strsplit(x, "_")[[1]][[2]], 
+                                                     function(y) strsplit(y, "-")[[1]][[2]])))
+# Create a PID column for each patient
+for (i in 1:20){
+  if (dim(indel_list[[i]])[1] != 0){
+    indel_list[[i]]$PID <- PID_indel[i]
+  }
+  if (dim(snv_list[[i]])[1] != 0){
+    snv_list[[i]]$PID <- PID_snv[i]
+  }
+}
+
+# There are columns with different object types
+for (i in 1:20){
+  snv_list[[i]]$X.CHROM <- as.character(snv_list[[i]]$X.CHROM)
+  snv_list[[i]]$seqBiasPresent_1 <- as.character(snv_list[[i]]$seqBiasPresent_1)
+  snv_list[[i]]$seqBiasPresent_2 <- as.character(snv_list[[i]]$seqBiasPresent_2)
+}
+
+# Remove empty patients in indels
+with <- NULL
+for (i in 1:20){
+  if (dim(indel_list[[i]])[1] != 0){
+    with <- c(with, i)
+  }
+}
+
+indel_list <- indel_list[with]
+
+# There are columns with different object types
+for (i in 1:13){
+  indel_list[[i]]$ENCODE_DNASE <- as.character(indel_list[[i]]$ENCODE_DNASE)
+  indel_list[[i]]$X.CHROM <- as.character(indel_list[[i]]$X.CHROM)
+}
+indel_list[[i]]$ID <- as.character(indel_list[[i]]$ID)
+indel_list[[i]]$REF <- as.character(indel_list[[i]]$REF)
+indel_list[[i]]$ALT <- as.character(indel_list[[i]]$ALT)
+indel_list[[i]]$QUAL <- as.character(indel_list[[i]]$QUAL)
+indel_list[[i]]$FILTER <- as.character(indel_list[[i]]$FILTER)
+
+# Create merged data frames
+all_snvs <- Reduce(full_join, snv_list)
+all_indels <- Reduce(full_join, indel_list)
+
+write.table(all_indels, 
+            file = "/omics/groups/OE0436/data/jimenez/data/snv_indels/vcf/all_indels_all_patients_metastasis2_definitive.vcf", sep = "\t", col.names = TRUE, row.names = FALSE)
+write.table(all_snvs, 
+            file = "/omics/groups/OE0436/data/jimenez/data/snv_indels/vcf/all_snvs_all_patients_metastasis2_definitive.vcf", sep = "\t", col.names = TRUE, row.names = FALSE)
+```
+
+

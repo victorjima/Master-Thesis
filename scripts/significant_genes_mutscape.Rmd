@@ -1,0 +1,344 @@
+---
+title: <span style="font-family:Georgia;">Analysis of MutScape significant genes</span>
+author: "Víctor Jiménez Martínez"
+date: "2022"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Introduction
+
+The main goal of this script is to analyze and represent results from significantly mutated genes obtained with MutScape software. 
+
+## Libraries 
+
+```{r, results="hide", message=FALSE, warning=FALSE}
+# R version employed for this script is 4.2.0
+library(tidyr) # to manage data
+library(dplyr) # to manage data
+library(RColorBrewer) 
+library(rtracklayer)
+library(pheatmap) # heatmap
+library(clusterProfiler) # enrichment analysis
+library(enrichplot)
+library(msigdbr) # for enrichment analysis
+library(org.Hs.eg.db) # human data base
+# library(ggVennDiagram) # venn diagram
+library(ggvenn)
+library(DOSE)
+library(pathview) # visualize pathways
+library(simplifyEnrichment)
+```
+
+## Upload data
+
+```{r}
+# Read results from MutScape significantly mutated genes detection
+path <- "/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/"
+results_resp <- read.delim(paste0(path, "oncodriveclust_results_resp_pre_allmut.tsv"))
+results_non <- read.delim(paste0(path, "oncodriveclust_results_nonresp_pre_allmut.tsv"))
+
+# Catch significantly mutated genes in each group
+sig_genes_resp <- results_resp %>%
+  dplyr::filter(QVALUE < 0.05) %>% dplyr::select(GENE)
+
+sig_genes_non <- results_non %>%
+  dplyr::filter(QVALUE < 0.05) %>% dplyr::select(GENE)
+
+# All_sig_genes 
+all_sig_genes <- unique(c(sig_genes_resp$GENE, sig_genes_non$GENE))
+sig_genes <- data.frame("Gene" = all_sig_genes, 
+                        "group" = ifelse(all_sig_genes %in% sig_genes_resp$GENE,
+                                         "significant_in_responders",
+                                         "significant_in_non_responders"))
+
+# Save genes 
+write.table(sig_genes, 
+            file = "/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/sig_genes_mutscape_pre_respnonresp.tsv", 
+            sep = "\t", quote = FALSE, col.names = TRUE)
+
+# Import SNV vcf data and prepare it 
+# Read SNV data
+snv <- read.delim("/omics/groups/OE0436/data/jimenez/data/snv_indels/vcf/all_snvs_all_patients_metastasis1_definitive.vcf")  
+
+# Read pheno data
+pheno <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/PID_treatment.csv", 
+                  header = TRUE, sep = ";", row.names = "PID")
+colnames(pheno) = c("therapy", "evolution") # change names
+
+pheno <- pheno %>% 
+  mutate(response = ifelse(evolution == "PR", "responders", "non-responders")) %>%
+  filter(rownames(pheno) %in%  unique(snv$PID))
+```
+
+## Heatmap
+Oncoprint makes a better representation of this mutational landscape than the heatmap.
+
+```{r}
+# Filter rows that do not represent a somatic mutation and select those interesting fields 
+# Also filter for those significantly mutated genes
+snv_select <- snv %>% 
+  filter(RECLASSIFICATION=="somatic" | RECLASSIFICATION=="somatic_precious") %>%
+  dplyr::select(PID, GENE, ANNOVAR_FUNCTION, EXONIC_CLASSIFICATION, X.CHROM, POS)  %>% 
+  filter(GENE%in%all_sig_genes, PID%in%rownames(pheno))
+
+# Create a matrix of gene alterations 
+matrix <- snv_select %>%
+  dplyr::select(PID, GENE) %>%
+  dplyr::mutate(value=1) %>%
+  dplyr::distinct() %>%
+  tidyr::spread(GENE, value)
+
+# Transpose matrix and eliminate PID column
+rownames(matrix) <- matrix$PID
+matrix <- matrix %>% dplyr::select(-PID) %>% t
+
+# Replace NA by 0
+matrix[is.na(matrix)] <- 0
+
+# Subset pheno
+pheno <- pheno[colnames(matrix), ]
+
+# Heatmap
+pdf("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/heatmaps/heatmap_signmutgenes_pre_all_respnonresp.pdf")
+
+set.seed(123) # for generation of colors 
+pheatmap(matrix, scale = 'row',
+         annotation_col = pheno[,c(2,3)],
+         show_rownames = TRUE, show_colnames = TRUE,
+         annotation_legend = TRUE, annotation_names_col = FALSE,
+         row_title = "MutScape significantly mutated genes",
+         row_title_gp = gpar(fontsize = 10),
+         row_names_side = "left",
+         column_title = "Metastasis1 samples (pre-treatment)",
+         column_title_side = "bottom",
+         column_title_gp = gpar(fontsize = 10),
+        )
+
+dev.off()
+```
+
+## Enrichment analysis
+
+For enrichment analysis, clusterProfiler^1^ package is implemented, which conducts enrichment tests based on hypergeometric distribution and adjusts p-values and computes q-values. It allows for graphical representation of the terms/processes enriched based on p-value, gene counts and GeneRatio (the number of genes in the input list that match with the specific term divided by the number of genes of your gene list annotated in the whole hallmark). 
+
+```{r}
+genes <- list("responders" = sig_genes_resp$GENE, "non-responders" = sig_genes_non$GENE)
+
+# Annotate gene symbols as EntrezID
+genes_entrez <- lapply(genes, function(x) bitr(x, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db"))
+
+# Enrichment 
+ego_resp <- enrichGO(gene          = genes_entrez$responders$ENTREZID,
+                   keyType       = "ENTREZID",
+                   OrgDb         = org.Hs.eg.db,
+                   ont           = "BP",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff  = 0.2,
+                   qvalueCutoff  = 0.2,
+                   readable      = TRUE)
+
+ek_resp <- enrichKEGG(gene = genes_entrez$responders$ENTREZID,
+                    pvalueCutoff = 0.2,
+                    qvalueCutoff = 0.2)
+
+ego_non <- enrichGO(gene          = genes_entrez$`non-responders`$ENTREZID,
+                   keyType       = "ENTREZID",
+                   OrgDb         = org.Hs.eg.db,
+                   ont           = "BP",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff  = 0.4,
+                   qvalueCutoff  = 0.5,
+                   readable      = TRUE)
+
+ek_non <- enrichKEGG(gene = genes_entrez$`non-responders`$ENTREZID,
+                    pvalueCutoff = 0.2,
+                    qvalueCutoff = 0.2)
+
+
+# Table with all of them
+ego_resp@result$Response <- "responders"
+ego_resp@result$Type <- "GO term" 
+
+ego_non@result$Response <- "non-responders"
+ego_non@result$Type <- "GO term" 
+
+ek_resp@result$Response <- "responders"
+ek_resp@result$Type <- "KEGG pathway" 
+
+ek_non@result$Response <- "non-responders"
+ek_non@result$Type <- "KEGG pathway" 
+
+enrichment <- rbind(ego_resp@result, ego_non@result, ek_resp@result, ek_non@result)
+
+write.table(enrichment, 
+            file = "/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/enrichment/mutscape_enrichment.csv", quote = FALSE, sep = ",", row.names = TRUE, col.names = TRUE)
+
+# Some information
+# For ego_resp
+cat("There are", dim(ego_resp@result[ego_resp@result$p.adjust < 0.05, ])[1], 
+    "enriched processes in the responders mutated genes with an adjusted p-value < 0.05")
+
+ego_resp@result[ego_resp@result$p.adjust < 0.05, ]
+# There don't seem to be other than generic pathways altered
+
+terms <- c("RNA splicing", "mRNA processing")
+ego_resp_mRNA <- subset_enrichResult(ego_resp, which(ego_resp@result$Description %in% terms))
+
+# For ek_resp
+cat("There are", dim(ek_resp@result[ek_resp@result$p.adjust < 0.05, ])[1], 
+    "enriched pathways in the responders mutated genes with an adjusted p-value < 0.05")
+
+ek_resp@result[ek_resp@result$p.adjust < 0.05, ]
+
+#There seem to be a set of altered pathways related to immune functions. They are subset
+pathways <- c("Natural killer cell mediated cytotoxicity", 
+              "B cell receptor signaling pathway", 
+              "T cell receptor signaling pathway",  
+              "PD-L1 expression and PD-1 checkpoint pathway in cancer",
+              "Chemokine signaling pathway")
+ek_resp_immune <- subset_enrichResult(ek_resp, which(ek_resp@result$Description %in% pathways))
+ek_resp_immune@result$geneID <- c("NRAS", "NRAS", "NRAS", "NRAS", "NRAS")
+
+# For ego_non
+cat("There are", dim(ego_non@result[ego_non@result$p.adjust < 0.15, ])[1], 
+    "enriched processes in the non-responders mutated genes with an adjusted p-value < 0.15")
+
+ego_non@result[ego_non@result$p.adjust < 0.15, ]
+
+# There seem to be a set of altered terms related to negative immune functions. They are subset
+
+terms_non <- c("negative regulation of humoral immune response mediated by circulating immunoglobulin",
+               "negative regulation of humoral immune response",
+               "negative regulation of immunoglobulin mediated immune response",
+               "negative regulation of B cell activation",
+               "positive regulation of tolerance induction" )
+ego_non_immune <- subset_enrichResult(ego_non, which(ego_non@result$Description %in% terms_non))
+
+# For ek_non
+cat("There are", dim(ek_non@result[ek_non@result$p.adjust < 0.2, ])[1], 
+    "enriched pathways in the non-responders mutated genes with an adjusted p-value < 0.2")
+
+ek_non@result[ek_non@result$p.adjust < 0.2, ]
+
+# Two interesting terms
+pathways_non <- c("Leukocyte transendothelial migration", "Natural killer cell mediated cytotoxicity")
+ek_non_immune <- subset_enrichResult(ek_non, which(ek_non@result$Description %in% pathways_non))
+ek_non_immune@result$geneID <- c("VASP", "BRAF")
+
+# Graphical representations
+pdf("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/enrichment/enrichment_analysis_mutscape_sig_all_patients_respnonresp_pre.pdf")
+
+# Responders
+enrichplot::dotplot(ego_resp, title = "GO terms encriched in responders significantly mutated genes", showCategory = 10)
+cnetplot(ego_resp)
+heatplot(ego_resp)
+enrichplot::emapplot(pairwise_termsim(ego_resp))
+enrichplot::dotplot(ek_resp, title = "KEGG pathways enriched in responders significantly mutated genes", showCategory = 10)
+
+# With selected pathways
+enrichplot::dotplot(ek_resp_immune, title = "KEGG immune pathways altered in responders")
+cnetplot(ek_resp_immune)
+heatplot(ek_resp_immune)
+enrichplot::dotplot(ego_resp_mRNA, title = "GO mRNA terms altered in responders")
+cnetplot(ego_resp_mRNA)
+
+# Non-responders
+enrichplot::dotplot(ego_non, title = "GO terms enriched in non-responders significantly mutated genes", showCategory = 10)
+cnetplot(ego_non)
+heatplot(ego_non)
+emapplot(pairwise_termsim(ego_non))
+enrichplot::dotplot(ek_non, title = "KEGG pathways enriched in non-responders significantly mutated genes", showCategory = 10)
+
+# With selected terms and pathways
+enrichplot::dotplot(ek_non_immune, title = "KEGG immune pathways altered in non-responders")
+cnetplot(ek_non_immune)
+heatplot(ek_non_immune)
+enrichplot::dotplot(ego_non_immune, title = "GO immune terms altered in non-responders")
+cnetplot(ego_non_immune)
+heatplot(ego_non_immune)
+
+dev.off()
+
+# KEGG pathway plots
+
+# Responders 
+
+# Natural Killer mediated cytotoxicity
+pathview(gene.data = genes_entrez$responders$ENTREZID, pathway.id = "hsa04650", species = "hsa")
+pathview(gene.data = genes_entrez$responders$ENTREZID, pathway.id = "hsa04650", 
+                species = "hsa", kegg.native = F)
+
+# B cell receptor signalling pathway
+pathview(gene.data = genes_entrez$responders$ENTREZID, pathway.id = "hsa04662", species = "hsa")
+pathview(gene.data = genes_entrez$responders$ENTREZID, pathway.id = "hsa04662", 
+                species = "hsa", kegg.native = F)
+
+# PD-L1 expression and PD-1 checkpoint pathway in cancer
+pathview(gene.data = genes_entrez$responders$ENTREZID, pathway.id = "hsa05235", species = "hsa")
+pathview(gene.data = genes_entrez$responders$ENTREZID, pathway.id = "hsa05235", 
+                species = "hsa", kegg.native = F)
+
+# T cell receptor signaling pathway 
+pathview(gene.data = genes_entrez$responders$ENTREZID, pathway.id = "hsa04660", species = "hsa")
+pathview(gene.data = genes_entrez$responders$ENTREZID, pathway.id = "hsa04660", 
+                species = "hsa", kegg.native = F)
+
+
+## Venn Diagrams
+pdf("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/venn_mutscape_sig_genes.pdf")
+
+ggvenn(genes, fill_color = c("green", "red"))
+
+dev.off()
+```
+
+## Significant genes in post-treatment samples 
+
+There were no significant genes detected in responders. In that way, we can say immune checkpoint inhibitors might be targeting those cell lines bearing the previously detected mutations. The detected genes in non-responders were the same.
+
+```{r}
+# # Read results from MutScape significantly mutated genes detection
+# path <- "/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/"
+# results_resp_met2 <- read.delim(paste0(path, "oncodriveclust_results_resp_met2_allmut.tsv"))
+# results_non_met2 <- read.delim(paste0(path, "oncodriveclust_results_nonresp_pre_allmut.tsv"))
+# 
+# # Catch significantly mutated genes in each group
+# sig_genes_resp_met2 <- results_resp_met2 %>%
+#   dplyr::filter(QVALUE < 0.05) %>% dplyr::select(GENE)
+# 
+# sig_genes_non_met2 <- results_non_met2 %>%
+#   dplyr::filter(QVALUE < 0.05) %>% dplyr::select(GENE)
+# 
+# # All_sig_genes 
+# all_sig_genes_met2 <- unique(c(sig_genes_resp_met2$GENE, sig_genes_non_met2$GENE))
+# sig_genes_met2 <- data.frame("Gene" = all_sig_genes_met2, 
+#                         "group" = ifelse(all_sig_genes_met2 %in% sig_genes_resp_met2$GENE,
+#                                          "significant_in_responders",
+#                                          "significant_in_non_responders"))
+# # sig_genes$group[sig_genes$Gene == "BRAF"] <- "significant_in_both"
+# 
+# # Save genes 
+# write.table(sig_genes_met2, 
+#             file = "/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/sig_genes_mutscape_met2_respnonresp.tsv", 
+#             sep = "\t", quote = FALSE, col.names = TRUE)
+# 
+# ## Venn Diagrams
+# genes <- list("responders metastasis1" = sig_genes_resp$GENE, 
+#               "responders metastasis2" = sig_genes_resp_met2$GENE,
+#               "non-responders metastasis1" = sig_genes_non$GENE, 
+#               "non-responders metastasis2" = sig_genes_non_met2$GENE)
+# 
+# pdf("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/venn_mutscape_sig_genes_prepost.pdf")
+# 
+# ggvenn(genes, fill_color = c("green", "red", "light green", "orange"), 
+#        text_size = 4, set_name_size = 2) 
+# 
+# 
+# dev.off()
+```
+
+## References
+1. 	Yu, G., Wang, L.-G., Han, Y. & He, Q.-Y. clus-terProfiler: an R Package for Comparing Bio-logical Themes Among Gene Clusters. doi:10.1089/omi.2011.0118 (2012).

@@ -1,0 +1,450 @@
+---
+title: <span style="font-family:Georgia;">Descriptive analysis of mutations through oncoprints and karyograms</span>
+author: "Víctor Jiménez Martínez"
+date: "2022"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Introduction
+
+The main goal of this script is to obtain an oncoprint plot depicting the mutational landscape of our samples and a karyogram seeing it in the genome. 
+
+Oncoprint is a heatmap-like tool to visualize genomic alterations, provided by the ComplexHeatmap^1^ package. 
+
+## Libraries
+
+Libraries needed for the script are loaded below.
+
+```{r, results="hide", message=FALSE, warning=FALSE}
+# R version employed for this script is 4.2.0
+library(tidyr) # to manage data
+library(dplyr) # to manage data
+library(RColorBrewer) # for colour
+library(ComplexHeatmap) # oncoprint
+library(GenomicRanges) # for creating Genomic Ranges
+library(ggbio) # karyogram
+library(GenomicFeatures)
+library(rtracklayer)
+library(gtools)
+```
+
+## Import and merge data 
+
+First of all, data is loaded and modified to a proper format. 
+
+```{r}
+# SNV data
+snv <- read.delim("/omics/groups/OE0436/data/jimenez/data/snv_indels/vcf/all_snvs_all_patients_metastasis2_definitive.vcf")  
+
+# Estabilsh patients ID
+# snv$PID <- gsub("/icgc/dkfzlsdf/project/hipo2/hipo_K28A/sequencing/exon_sequencing/view-by-pid/.*/snv_results/paired/", "", snv$FILENAME)
+# snv$PID <- gsub("_.*/results_SNVCallingWorkflow-.*/snvs", "", snv$PID)
+# snv$PID <- gsub("_somatic_functional_snvs_conf_8_to_10.vcf", "", snv$PID)
+
+# Filter rows that do not represent a somatic mutation and select those interesting fields
+snv_select <- snv %>% 
+  filter(RECLASSIFICATION =="somatic" | RECLASSIFICATION == "somatic_precious" | GENE == "KHSRP" | GENE == "DPY19L4") %>% # we catch also two genes of MutScape significant genes
+  dplyr::select(PID, GENE, ANNOVAR_FUNCTION, EXONIC_CLASSIFICATION, X.CHROM, POS)
+
+# Compute snv per patient
+snv_per_patient = snv_select %>%
+  dplyr::group_by(PID) %>%
+  dplyr::tally() %>%
+  dplyr::rename(n_SNV = n)
+
+# INDEL data 
+indel <- read.delim("/omics/groups/OE0436/data/jimenez/data/snv_indels/vcf/all_indels_all_patients_metastasis2_definitive.vcf")  
+# Estabilsh patients ID
+# indel$PID <- gsub("/icgc/dkfzlsdf/project/hipo2/hipo_K28A/sequencing/exon_sequencing/view-by-pid/.*/indel_results/paired/", "", indel$FILENAME)
+# indel$PID <- gsub("_.*/results_IndelCallingWorkflow-.*/indel", "", indel$PID)
+# indel$PID <- gsub("_somatic_functional_indels_conf_8_to_10.vcf", "", indel$PID)
+
+# Filter rows that do not represent a somatic mutation and select those interesting fields
+indel_select <- indel %>%
+  dplyr::select(PID, GENE, ANNOVAR_FUNCTION, EXONIC_CLASSIFICATION, X.CHROM, POS)
+
+# Compute indel per patient
+indel_per_patient = indel_select %>%
+  dplyr::group_by(PID) %>%
+  dplyr::tally() %>%
+  dplyr::rename(n_SNV = n)
+
+# Combine snvs and indels
+snv_indels <- rbind(snv_select, indel_select)
+
+# Add mutation level
+snv_indels$mut_level <- paste(snv_indels$ANNOVAR_FUNCTION, snv_indels$EXONIC_CLASSIFICATION, sep = "_")
+snv_indels$mut_level = gsub("_\\.", "", snv_indels$mut_level)
+snv_indels$mut_level = gsub(" ", "_", gsub(";", "_", snv_indels$mut_level))
+
+# Remove exon information from "splicing" SNVs
+snv_indels$GENE <- gsub("\\(.*", "", snv_indels$GENE)  
+
+# Compute indel and SNV per patient
+mut_per_patient <- merge(snv_per_patient, indel_per_patient, all=TRUE)
+```
+
+## Select genes for oncoprint 
+
+The selection of genes can follow different criteria: the top 25 mutated genes of the cohort, which may be useful but it is probable that most mutated genes are also the largest, being the mutations by chance rather than biologically related;  COSMIC data base melanoma related genes and lastly the obtained results from MutScape (significant_genes_mutscape.Rmd script).
+
+### Most mutated genes
+
+```{r}
+# Get rid off genes that only appear in one patient
+# Compute occurrences by sample and gene
+genes_patient <- snv_indels %>%
+  group_by(PID, GENE) %>%
+  summarise(n_occ = n())
+
+# Catch those duplicated genes
+duplicated_genes <- genes_patient$GENE[which(duplicated(genes_patient$GENE))]
+
+# Select those duplicated genes
+snv_indels_filter <- snv_indels[snv_indels$GENE%in%duplicated_genes, ]
+
+# Compute number of alterations by gene
+genes <- snv_indels_filter %>%
+  dplyr::group_by(GENE) %>%
+  dplyr::tally() %>%
+  dplyr::rename(n_occ = n)
+  
+# Top 25 genes with more alterations
+top_genes <- as.data.frame(genes)[order(genes$n_occ, decreasing = T), ]$GENE[1:25]
+```
+
+### Cancer related genes 
+
+COSMIC database allows access to a Cancer Gene Census containing genes whose mutations and alterations have been associated with cancer activity, progression, function... I will use a filtered table of 36 tier 1 genes (genes proved to have relation) associated with the term "melanoma".
+
+```{r}
+cosmic <- read.delim("/omics/groups/OE0436/data/jimenez/data/COSMIC_Cancer_Gene_Census_melanoma_tier1.tsv", header = TRUE) # tier 1
+
+cosmic <- read.delim("/omics/groups/OE0436/data/jimenez/data/COSMIC_Cancer_Genes_melanoma_tier1_2.tsv", header = TRUE) # tier 1 and tier 2
+
+cosmic <- read.delim("/omics/groups/OE0436/data/jimenez/data/COSMIC_Cancer_Gene_Census_allgenes_tier12.tsv", header = TRUE) # all tier 1 and tier 2 COSMIC cancer genes
+
+# Filter those genes representing only germline mutations
+cosmic$Somatic <- ifelse(cosmic$Somatic == "yes", 1, 0)
+cosmic_sel <- cosmic[cosmic$Somatic == 1, ]
+
+# Filter those genes that are related only to uveal melanoma
+cosmic_sel <- cosmic_sel[-which(grepl("uveal melanoma", cosmic$Tumour.Types.Somatic.)), ]
+
+# Top 51 genes associated with melanoma according to COSMIC
+top_genes <- cosmic_sel$Gene.Symbol
+```
+
+### MutScape significantly mutated genes
+
+```{r}
+mutscape <- read.delim("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/MutScape/sig_genes_mutscape_pre_respnonresp.tsv", header = TRUE)
+
+top_genes <- mutscape$Gene
+```
+
+## Filter snv_indels to contain only samples before treatment
+
+Only required if the files you use have the samples for the different pre- and post- treatment points.
+
+```{r}
+# metastasis1 <- unique(snv_indels$PID)[which(grepl("metastasis1", all_patients))]
+# 
+# snv_indels <- snv_indels %>% filter(PID %in% metastasis1)
+```
+
+## Matrix for each mutation
+
+```{r}
+# Establish functional mutational levels
+mut_levels_raw <- unique(snv_indels$mut_level) 
+
+snv_indels$mut_level[snv_indels$mut_level == "exonic_stopgain"] <- "stopgain"
+snv_indels$mut_level[snv_indels$mut_level == "exonic_stoploss"] <- "stoploss"
+snv_indels$mut_level[snv_indels$mut_level == "exonic_frameshift_deletion"] <- "frameshift_deletion"
+snv_indels$mut_level[snv_indels$mut_level == "exonic_frameshift_insertion"] <- "frameshift_insertion"
+snv_indels$mut_level[snv_indels$mut_level == "exonic_nonframeshift_deletion"] <- "nonframeshift_deletion"
+snv_indels$mut_level[snv_indels$mut_level == "exonic_nonframeshift_insertion"] <- "nonframeshift_insertion"
+snv_indels$mut_level[snv_indels$mut_level == "exonic_nonsynonymous_SNV"] <- "nonsynonymous_SNV"
+snv_indels$mut_level[snv_indels$mut_level == "exonic_splicing_unknown" |
+                       snv_indels$mut_level == "exonic_splicing_nonsynonymous_SNV" |
+                       snv_indels$mut_level == "exonic_splicing_synonymous_SNV"] <- "splicing"
+snv_indels$mut_level[snv_indels$mut_level == "exonic_unknown"] <- "unknown"
+
+# Filter data frame for top genes
+snv_indels_top <- snv_indels %>%
+  filter(GENE %in% top_genes)
+
+mut_levels <- unique(snv_indels_top$mut_level)
+
+# Create a list of matrices for each mutation type
+mut_list <- list()
+for (mut in mut_levels){
+  
+  # Filter alterations by mutation level and top genes and create a matrix containing these alterations
+  x <- snv_indels %>%
+    dplyr::filter(mut_level == mut, GENE%in%top_genes | # filter by mutation and genes
+                    grepl(paste0(paste0("^", top_genes, "[,;]"), collapse="|"), GENE) | # allow for multi-gene mutations
+                    grepl(paste0(paste0("[,;]", top_genes, "$"), collapse="|"), GENE) ) %>%  
+    dplyr::select(PID, GENE) %>% # select only the patient and the gene
+    dplyr::mutate(value=1) %>% # each mutation gets a point
+    dplyr::distinct() #%>%
+  
+  if(dim(x)[1] != 0){ # if there are alterations for the top genes in the mutation level 
+    x <- x %>% 
+      tidyr::spread(GENE, value) # this will create columns for each gene and sum all alterations per patient
+    
+    # Rownames and transpose
+    rownames(x) <- x$PID
+    x <- x %>%
+      dplyr::select(-PID) %>%
+      t
+    
+    # Replace NA by 0
+    x[is.na(x)] = 0
+  
+  }else{
+    x = tibble(0) # create an empty matrix
+    colnames(x) = placeholder_pid
+    rownames(x) = placeholder_gene
+  }
+  
+  # Add to list
+  mut_list[[mut]] = as.matrix(x)
+}
+```
+
+Further preparation of the mutation matrix for the oncoprint is performed.
+
+```{r}
+# Load pheno data 
+pheno <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/PID_treatment.csv", 
+                  header = TRUE, sep = ";", row.names = "PID")
+colnames(pheno) = c("therapy", "evolution") # change names
+
+pheno <- pheno %>% 
+  mutate(response = ifelse(evolution == "PR", "responders", "non-responders"))
+
+# Make empty matrix containing all samples
+placeholder_pid <- NA
+placeholder_gene = "ATF1"
+pids <- unique(snv_indels$PID)
+placeholder <- matrix(data = 0, nrow = 1, ncol = length(pids))
+rownames(placeholder) <- placeholder_gene
+colnames(placeholder) <- pids
+
+# Unify matrices in mut_list
+mut_list2 <- unify_mat_list(mut_list)
+
+# Colors 
+colors_mut <- c(#exonic_unknown = "grey",
+  #exonic_synonymous_SNV = "#FFFFBF",
+  #exonic_splicing = "lightgrey",
+  #splicing_synonymous_SNV = "cornflowerblue",
+  splicing = "firebrick4",
+  #exonic_splicing_nonsynonymous_SNV = "#FFA76B",
+  exonic_splicing_synonymous_SNV = "#FFA76B",
+  #exonic_nonsynonymous_SNV = "#F06744",
+  nonsynonymous_SNV = "deepskyblue4",
+  stoploss = "firebrick3",
+  stopgain = "darkorange",
+  exonic = "darkblue",
+  nonframeshift_insertion = "darkolivegreen",
+  nonframeshift_deletion = "darkolivegreen4",
+  frameshift_insertion = "deeppink",
+  frameshift_deleltion = "darkorchid1",
+  #insertion_del = "blueviolet",
+  #splicing_nonsynonymous_SNV = "#AED1FF",
+  #SV_intronic = "#AED1FF",
+  #SV = "#486BAF",
+  #UTR5_UTR3 = "blue",
+  #AMP = "pink",
+  #sub = "lightblue1",
+  #LOH = "darkseagreen1",
+  #cnLOH = "#FFFFBF",
+  all_samples = "cornflowerblue"
+)
+
+# Order patients (columns) according to number of alterations
+# mut_list_sum <- Reduce('+', mut_list2) # collapses and sums all values per gene
+# mut_list_sum <- as.data.frame(t(mut_list_sum))
+#  
+# mut_list_sum[mut_list_sum > 0] <- 1
+#  
+# order_column <- order(rowSums(mut_list_sum), decreasing=TRUE)
+
+# Order patients according to group
+# Select those samples that are in the plot
+pids <- colnames(mut_list2[[1]])
+
+pheno <- pheno[pids, ]
+
+group <- pheno$response
+                     
+order_column <- order(group)
+
+# Order genes according to group
+mutscape2 <- left_join(data.frame(Gene = rownames(mut_list2[[2]])),  
+                     mutscape,
+                     by = "Gene")
+
+group_genes <- mutscape2$group
+
+order_rows <- order(group_genes, decreasing = T)
+# order_rows <- replace(order_rows, order_rows == 1, 2) # changing BRAF position
+# order_rows[20] <- 1
+```
+
+Expression levels of our genes are included.
+
+```{r}
+# TPM expression values
+tpm <- read.delim("/omics/groups/OE0436/data/jimenez/data/rnaseq/rnaseq_tpm_met2_protein_coding.tsv")
+colnames(tpm)[1:3] <- sapply(colnames(tpm)[1:3], function(x) gsub("^X", "", x)) # adapt five first PIDs
+
+# Pheno for expression data
+pheno_tpm <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/PID_treatment.csv", 
+                  header = TRUE, sep = ";", row.names = "PID")
+colnames(pheno_tpm) = c("therapy", "evolution") # change names
+pheno_tpm <- pheno_tpm[colnames(tpm)[which(colnames(tpm) %in% pids)], ]
+
+pheno_tpm <- pheno_tpm %>% 
+  mutate(response = ifelse(evolution == "PR", "responders", "non-responders"))
+
+order_tpm <- order(pheno_tpm$response)
+ 
+# Filter tpm matrix by genes and PIDS, in the same order 
+tpm <- tpm[mutscape2$Gene, which(colnames(tpm) %in% rownames(pheno_tpm))]
+tpm <- tpm[, order_tpm]
+```
+
+## Oncoprint
+
+Mutation_levels that are not present have to be commented out to prevent them appearing in legend
+
+```{r}
+pdf("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/oncoprints/oncoprint_COSMIC_all_patients_met2.pdf")
+
+set.seed(123) # for generation of colors 
+oncoPrint(mut_list2, column_order = order_column, col = colors_mut, 
+          row_order = order_rows,
+          row_title = "MutScape significantly mutated genes",
+          row_names_side = "left",
+          row_title_gp = gpar(fontsize = 14),
+          pct_side = "right",
+          
+          column_title = "Metastasis2 samples (post-treatment)",
+          show_column_names = TRUE, 
+          column_names_gp = gpar(fontsize = 8),
+          column_title_side = "bottom",
+          column_title_gp = gpar(fontsize = 14),
+        
+          top_annotation = HeatmapAnnotation(
+            column_barplot = anno_oncoprint_barplot(border = TRUE, height = unit(4, "cm"))),
+          right_annotation = rowAnnotation(
+            row_barplot = anno_oncoprint_barplot(border = TRUE, height = unit(4, "cm"))),
+          bottom_annotation = HeatmapAnnotation(Response = group,
+            show_annotation_name = FALSE),
+          left_annotation = rowAnnotation(Significance = group_genes,
+                                          col = list(Significance = c(
+                                            significant_in_responders = "white",
+                                            # significant_in_both = "purple",
+                                            significant_in_non_responders = "light pink")),
+                                          show_annotation_name = FALSE),
+
+          alter_fun = list(
+  background = function(x, y, w, h) grid.rect(x, y, w, h, gp = gpar(fill = NA)),
+  
+  stopgain = function(x, y, w, h) {
+    grid.polygon(
+      unit.c(x + 0.5*w, x + 0.5*w, x - 0.5*w), 
+      unit.c(y + 0.5*h, y - 0.5*h, y + 0.5*h),
+      gp = gpar(fill = colors_mut["stopgain"]))},
+  
+  frameshift_deletion = function(x, y, w, h) {
+    grid.polygon(
+      unit.c(x - 0.5*w, x - 0.5*w, x + 0.5*w),
+      unit.c(y - 0.5*h, y + 0.5*h, y - 0.5*h),
+      gp = gpar(fill = colors_mut["frameshift_deleltion"]))},
+  
+  splicing = function(x, y, w, h) {
+  grid.circle(x, y, w*0.3, h*0.3, gp = gpar(fill = colors_mut["splicing"], col = NA))},
+  
+  nonsynonymous_SNV = function(x, y, w, h) {
+  grid.circle(x, y, w*0.3, h*0.3, gp = gpar(fill = colors_mut["nonsynonymous_SNV"], col = NA))},
+  
+  stoploss = function(x, y, w, h) {
+        grid.segments(x - w*0.4, y - h*0.4, x + w*0.4, y + h*0.4, gp = gpar(lwd = 2))
+        grid.segments(x + w*0.4, y - h*0.4, x - w*0.4, y + h*0.4, gp = gpar(lwd = 2))},
+  
+  frameshift_insertion = function(x, y, w, h) { 
+    grid.rect(x, y, w*0.9, h*0.9, gp = gpar(fill = colors_mut["frameshift_insertion"], col = NA))}
+)
+) + Heatmap(as.matrix(tpm), name = "Expression", 
+            width = unit(3, "cm"), row_order = order_rows,
+            show_column_names = FALSE, show_row_names = FALSE,
+            cluster_rows = FALSE, cluster_columns = FALSE)
+
+dev.off()
+```
+## Karyogram
+
+In this section, three karyograms will be built to see the location of the alterations through the genome for each response group.
+
+```{r}
+# Define patient ID and groups
+pids <- unique(snv_indels$PID)
+
+group <- pheno[pids, 3]
+
+# Generate a chromosome column with a right annotation for GRanges
+snv_indels$chr <- paste0("chr", snv_indels$X.CHROM)
+
+# Obtain a data frame for each group
+snv_indels_resp <- snv_indels %>%
+  filter(snv_indels$PID %in% rownames(pheno)[pheno$response == "responders"])
+
+snv_indels_non <- snv_indels %>%
+  filter(snv_indels$PID %in% rownames(pheno)[pheno$response == "non-responders"])
+
+# Get chromosomes info (seqingo GRanges of human chromosomes)
+hg <- GRangesForUCSCGenome("hg19")
+
+# Build GRanges objects for each group
+seqinfo_resp <- seqinfo(hg)[unique(snv_indels_resp$chr)]
+gr_resp <-GRanges(seqnames = Rle(snv_indels_resp$chr),
+             ranges =  IRanges(start = snv_indels_resp$POS, end = snv_indels_resp$POS),
+             strand =  Rle(strand("*")),
+             Alteration = snv_indels_resp$mut_level,
+             seqinfo = seqinfo_resp)
+seqlevels(gr_resp) <- gtools::mixedsort(seqlevels(gr_resp))
+
+seqinfo_non <- seqinfo(hg)[unique(snv_indels_non$chr)]
+gr_non <-GRanges(seqnames = Rle(snv_indels_non$chr),
+                ranges =  IRanges(start = snv_indels_non$POS, end = snv_indels_non$POS),
+                strand =  Rle(strand("*")),
+                Alteration = snv_indels_non$mut_level,
+                seqinfo = seqinfo_non)
+seqlevels(gr_non) <- gtools::mixedsort(seqlevels(gr_non))
+
+# Build Karyograms
+pdf("/omics/groups/OE0436/data/jimenez/outputs/mutation_analysis_all_patients/karyogram/karyogram_all_patients.pdf")
+
+par(mfrow=c(3,1))
+
+autoplot(gr_resp, layout = "karyogram",
+         aes(color = Alteration, fill = Alteration),
+         main = "Karyogram for responders samples pre-treatment")
+
+autoplot(gr_non, layout = "karyogram",
+         aes(color = Alteration, fill = Alteration),
+         main = "Karyogram for non-responders samples pre-treatment")
+
+dev.off()
+
+```
+## References
+1. Gu, Z., Eils, R. & Schlesner, M. Complex heatmaps reveal patterns and correlations in multidimensional genomic data. Bioinformatics 32, 2847–2849 (2016).

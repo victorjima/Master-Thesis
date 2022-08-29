@@ -1,0 +1,317 @@
+---
+title: <span style="font-family:Georgia;">Linear regression model for prediction with </span>
+author: "Víctor Jiménez Martínez"
+date: "2022"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Introduction
+
+The caret package (Classification And REgression Training) is a set of functions that attempt to streamline the process for creating predictive models. The package contains tools for feature selection, model tuning and others. The package provides a uniform interface for the different modeling functions in R. 
+
+The goal is to accomplish a predictive model using expression data and NRAS/BRAF. 
+
+
+## Libraries
+
+Libraries needed for the analyses are loaded below.
+
+```{r, results="hide", message=FALSE, warning=FALSE}
+# R version used in this script is 4.2.0
+install.packages("caret")
+library(caret)
+library(ggplot2) # plots
+library(tidyr) # to manage data
+library(dplyr) # to manage data
+library(ROCR) # for classification accuracy analysis
+```
+
+# Loading and preparing data
+
+Different genes will be used to build the model. First of all, NRAS and BRAF mutations will be taken into account. On the other hand, expression of some differentially expressed cytokines or immune-related genes will be considered: IL1B, IL2RA and CD58 (as selected by the mixOmics model), CXCL1, CCR7 and IL1A. Another iteration can be done with the top differentially expressed genes based on p-values. 
+
+```{r}
+# TPM Expression data for DEG
+# DEG are loaded 
+deg <- read.delim("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/DEA/protein_coding_genes/DEG_protein_coding_pre.tsv")
+
+# Read again tpm
+tpm <- read.delim("/omics/groups/OE0436/data/jimenez/data/rnaseq/rnaseq_tpm_met1_protein_coding.tsv")
+colnames(tpm)[1:5] <- sapply(colnames(tpm)[1:5], function(x) gsub("^X", "", x)) # adapt five first PIDs
+
+tpm_deg <- tpm[rownames(deg), ] # subset for our genes
+
+## Select one of these three options to build a model 
+# For the one including all deg, a stepwise selection will be performed and it is for glm
+# Select interest genes
+seldeg <- tpm_deg[c("IL1B", "IL1A", "CD58", "CXCL1", "CCR7", "IL2RA"),]
+
+# Top deg
+seldeg <- deg[deg$padj < 0.001, ]
+
+# All deg
+seldeg <- tpm_deg
+
+
+# SNV data
+snv <- read.delim("/omics/groups/OE0436/data/jimenez/data/snv_indels/vcf/all_snvs_all_patients_metastasis1_definitive.vcf")  
+
+# Filter rows that do not represent a somatic mutation and select those interesting fields
+snv_select <- snv %>% 
+  filter(RECLASSIFICATION=="somatic" | RECLASSIFICATION=="somatic_precious") %>%
+  dplyr::select(PID, GENE, ANNOVAR_FUNCTION, EXONIC_CLASSIFICATION, X.CHROM, POS)
+
+# Add mutation level
+snv_select$mut_level <- paste(snv_select$ANNOVAR_FUNCTION, snv_select$EXONIC_CLASSIFICATION, sep = "_")
+snv_select$mut_level = gsub("_\\.", "", snv_select$mut_level)
+snv_select$mut_level = gsub(" ", "_", gsub(";", "_", snv_select$mut_level))
+
+# Modify mutation levels
+snv_select$mut_level[snv_select$mut_level == "exonic_stopgain"] <- "stopgain"
+snv_select$mut_level[snv_select$mut_level == "exonic_stoploss"] <- "stoploss"
+snv_select$mut_level[snv_select$mut_level == "exonic_nonsynonymous_SNV"] <- "nonsynonymous SNV"
+snv_select$mut_level[snv_select$mut_level == "exonic_splicing_unknown" |
+                       snv_select$mut_level == "exonic_splicing_nonsynonymous_SNV" |
+                       snv_select$mut_level == "exonic_splicing_synonymous_SNV"] <- "splicing"
+
+# INDEL data 
+indel <- read.delim("/omics/groups/OE0436/data/jimenez/data/snv_indels/vcf/all_indels_all_patients_metastasis1_definitive.vcf") 
+
+# Filter rows that do not represent a somatic mutation and select those interesting fields
+indel_select <- indel %>%
+  dplyr::select(PID, GENE, ANNOVAR_FUNCTION, EXONIC_CLASSIFICATION, X.CHROM, POS)
+
+# Add mutation level
+indel_select$mut_level <- paste(indel_select$ANNOVAR_FUNCTION, indel_select$EXONIC_CLASSIFICATION, sep = "_")
+indel_select$mut_level = gsub("_\\.", "", indel_select$mut_level)
+indel_select$mut_level = gsub(" ", "_", gsub(";", "_", indel_select$mut_level))
+
+# Modify mutation levels
+indel_select$mut_level[indel_select$mut_level == "exonic_frameshift_deletion"] <- "frameshift deletion"
+indel_select$mut_level[indel_select$mut_level == "exonic_frameshift_insertion"] <- "frameshift insertion"
+indel_select$mut_level[indel_select$mut_level == "exonic_nonframeshift_deletion"] <- "nonframeshift deletion"
+indel_select$mut_level[indel_select$mut_level == "exonic_nonframeshift_insertion"] <- "nonframeshift insertion"
+indel_select$mut_level[indel_select$mut_level == "exonic_unknown"] <- "unknown"
+indel_select$mut_level[indel_select$mut_level == "exonic_stopgain"] <- "stopgain"
+
+# Combine snvs and indels
+snv_indels <- rbind(snv_select, indel_select)
+
+# Remove exon information from "splicing" SNVs
+snv_indels$GENE = gsub("\\(.*", "", snv_indels$GENE)
+
+# Construct a matrix of mutations
+snv_indels <- snv_indels %>% dplyr::select(PID, GENE) %>%
+  mutate(n = 1) %>% dplyr::distinct() %>% tidyr::spread(GENE, n)
+rownames(snv_indels) <- snv_indels$PID
+snv_indels <- snv_indels %>% dplyr::select(-PID) %>% t()
+snv_indels[is.na(snv_indels)] <- 0
+
+# Select NRAS and BRAF
+selmut <- snv_indels[c("NRAS", "BRAF"), ]
+```
+
+All our available data in pre-treatment samples has information for the same patients: 21 out of the 24 in the cohort. We have to order them in the same order and read pheno data accordingly. 
+
+```{r}
+# Check order
+identical(colnames(selmut), colnames(seldeg))
+
+# Pheno data with information on treatment and response
+pheno <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/PID_treatment.csv", 
+                  header = TRUE, sep = ";", row.names = "PID")
+
+colnames(pheno) = c("therapy", "evolution") # change names
+
+pheno <- pheno %>% 
+  mutate(response = ifelse(evolution == "PR", "responders", "non-responders"))
+
+pheno <- pheno[colnames(tpm), ]
+
+# Create data frame with all 8 variables
+selvar <- as.data.frame(t(rbind(seldeg, selmut)))
+
+# Add response to our data set
+selvar <- selvar %>% mutate(Response = as.factor(pheno$response))
+selvar$NRAS <- as.factor(selvar$NRAS)
+selvar$BRAF <- as.factor(selvar$BRAF)
+```
+
+## Models
+First of all, a random sample for training and testing is generated, then the fit control is generated. 
+
+```{r}
+################## Training and testing partition #########################################
+# Select 10 samples for training 
+# set.seed(123)
+# inTraining <- createDataPartition(pheno$response, p = 0.5, list = FALSE)
+# training <- selvar[ inTraining,]
+# testing  <- selvar[-inTraining,]
+
+set.seed(123)
+cases_model_idx <- c(sample(which(pheno$response == "responders"), 5),
+                     sample(which(pheno$response == "non-responders"), 5))
+training <- selvar[cases_model_idx, ]
+testing <- selvar[-cases_model_idx, ]
+```
+
+### Bayesian generalized linear model from caret package
+
+```{r}
+################## Bayesian generalized linear model with caret package ###################
+# Fit control
+# Generates parameters controling how the model is created and validated
+# 10-fold cross validation repeated 10 times is used
+fitControl <- trainControl(method = "repeatedcv",
+                           number = 10, # number of folds in k
+                           repeats = 10) # repeated 10 times)
+
+# Bayesian generalized linear model
+set.seed(825)
+bglm1 <- train(Response ~ ., data = training, 
+                 method = "bayesglm", 
+                 trControl = fitControl)
+bglm1
+
+bglm1$results # classification accuracy of 0.7
+
+## Performance
+# Testing the model
+pred <- predict(bglm1, newdata = testing) # prediction of test samples
+
+# Confussion matrix
+confusion.mat <- get.confusion_matrix(truth = pheno$response[-cases_model_idx], 
+                     predicted = pred)
+confusion.mat
+
+# Error rate: incorrect predictions in the total
+error_rate <- (confusion.mat[1,2] + confusion.mat[2,1]) / 10
+error_rate # 0.2
+
+# ROC curves
+# Test
+predobject <- ROCR::prediction(-as.vector(ifelse(pred == "non-responders", 1, 0)), testing$Response) # transforms predictions into a standarize format (the minus in linearpred is to obtain the ROC curve above the diagonal)
+
+perf <- performance(predobject, "tpr", "fpr") # constructs the ROC curve with true positive rate values and false positive rate values from predictions 
+
+plot(perf, sub = "AUC = 0.694", col = "red")
+abline(0,1)
+title("ROC curve for prediction performance of test samples")
+
+auc <- slot(performance(predobject,"auc"), "y.values")[[1]]
+auc # 0.694
+
+#Train
+pred.train <- predict(bglm1, newdata = training) # prediction of test samples
+predobject <- ROCR::prediction(-as.vector(ifelse(pred.train == "non-responders", 1, 0)),
+                               training$Response) # transforms predictions into a standarize format (the minus in linearpred is to obtain the ROC curve above the diagonal)
+perf <- performance(predobject, "tpr", "fpr") # constructs the ROC curve with true positive rate values and false positive rate values from predictions 
+
+plot(perf, sub = "AUC = 1", col = "red")
+abline(0,1)
+title("ROC curve for prediction performance of train samples")
+
+auc <- slot(performance(predobject,"auc"), "y.values")[[1]]
+auc # 1
+```
+
+### Generalized linear model with stepwise selection
+
+For this method, the procedure is the following. Having previously divided our samples into training and testing sets, the training set will be subject to a 10-fold cross-validation in which 1) a model with all deg + NRAS + BRAF model will be done, 2) stepwise selection will be performed to obtain an optimal model, 3) classification accuracy with this model will be performed, 4) final model with most selected variables will be tested with external testing set.
+
+```{r}
+################## Generalized linear model with stepwise selection ##########################
+# glmmodel <- glm(Response ~ ., data = training, family="binomial") # with all deg genes + NRAS and BRAF
+
+## 10-fold cross validation for stepwise variable selection with training data
+# Parameters
+k <- 10 # dividing training data into 10 groups
+n <- nrow(training) # number of individuals
+groups <- sample(rep(1:k, length.out=n)) # assign each of n individuals randomly to one of the k groups
+
+# Cross-validation loop
+pred.vector <- NULL # initialize vector where predictions will be stored
+selected.variables <- list() # initialize vector where selected variables will be stored
+for(i in 1:k){ # for every group
+  index.test <- which(groups==i) # stablish the indexes that will form the testing data
+  index.train <- which(groups!=i) # stablish the indexes that will form the training data
+  
+  glm.all <- glm(Response ~ ., 
+                 data = training[index.train, ], 
+                 family="binomial") # model with all deg genes, NRAS and BRAF
+  
+  stepwise <- step(glm.all, direction = "both") # stepwise selection of variables for the best model
+  
+  selected <- colnames(stepwise$model)[-1] # variables selected
+  selected.variables <- append(selected.variables, list(selected)) # add to list
+  
+  training_sel <- as.data.frame(training[, selected]) # create a training dataframe with the selected variables to further create a model 
+  rownames(training_sel) <- rownames(training)
+  colnames(training_sel) <- selected
+  training_sel$Response <- training$Response
+  
+  glm.optimal <- glm(Response ~ ., 
+                     data = training_sel[index.train, ],
+                     family = "binomial") # model with selected variables
+  
+  
+  pred.i <- predict(glm.optimal, newdata = training[index.test, ]) # makes predictions from testing data for each group
+  pred.vector[index.test] <- pred.i # stores predictions 
+}
+
+# Classification accuracy for 10-fold cross-validation with training samples
+# ROC curve and AUC
+pred <- prediction(pred.vector, pheno$response[cases_model_idx])
+
+auc <- slot(performance(pred,"auc"), "y.values")[[1]]
+auc
+
+perf <- performance(pred, "tpr", "fpr")
+plot(perf, sub = "AUC = 0.8", col = "red")
+abline(0,1)
+title("ROC curve for classification accuracy of training samples after 10-fold cross stepwise selection and validation")
+
+# Percentage of selected variables
+percentages <- data.frame(row.names = names(table(unlist(selected.variables))),
+                          "Counts" = as.numeric(table(unlist(selected.variables))),
+                          "Frequency" = as.numeric(table(unlist(selected.variables)))/10)
+
+# Most selected variables were CD58 and PMEL in 80% and 60% of cases, respectively
+
+## Optimal model
+best.glm <- glm(Response ~ CD58 + PMEL, data = training, family="binomial")
+
+# Classification accuracy for external data
+pred.test <- predict(best.glm, newdata = testing)
+pred.test.object <- prediction(pred.test, pheno$response[-cases_model_idx])
+
+auc <- slot(performance(pred.test.object,"auc"), "y.values")[[1]]
+auc
+
+perf <- performance(pred, "tpr", "fpr")
+plot(perf, sub = "AUC = 0.83", col = "red")
+abline(0,1)
+title("ROC curve for classification accuracy of testing samples with best model")
+
+# Confussion matrix
+# Predict on test
+pred.test.p <- predict(best.glm, newdata = testing, type = "response")
+
+# If p exceeds threshold of 0.5, 1 else 0
+resp_or_nonresp <- ifelse(pred.test.p > 0.5, "responders", "non-responders")
+
+# Convert to factor: p_class
+p_class <- factor(resp_or_nonresp, levels = levels(testing[["Response"]]))
+
+# Create confusion matrix
+confusionMatrix(p_class, testing[["Response"]]) # Accuracy 0.7273 (0.3903 - 0.9398 95% CI)
+```
+
+# References
+1. Kuhn, M. Building Predictive Models in R Us-ing the caret Package. J Stat Softw 28, 1–26 (2008).
+
+
+

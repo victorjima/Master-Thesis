@@ -1,0 +1,368 @@
+---
+title: <span style="font-family:Georgia;">Deconvolution with immunedeconv package</span>
+author: "Víctor Jiménez Martínez"
+date: "2022"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Introduction
+
+Infiltration of immune cells in the tumor bed may be informative for the immune state of the tumor and for the pre-diction of response to therapy, as discussed above. In that sense, traditional techniques such as immunohistochemistry, immunofluorescence and flow cytometry have been employed to characterize immune infiltrates^1^. However, the development of deconvolution tools allows the estimation  of abundances of cell types from RNAseq bulk expression data by modelling gene expression levels as weighted sums of the cell-type specific expression profiles^2^. Several computational methods have been developed to this date. 
+
+The main goal of this script is to infere tumor composition by estimating an immune score and a stromal score, which can then be indicative of the purity of the tumor. 
+
+Estimation of Stromal and Immune cells in Ma-lignant Tumors using Expression data (ESTIMATE)^3^ algorithm was employed through immunedeconv^4^ R package to infer the fraction of stromal and immune cells across our samples. Its defined “immune” signature is based on genes associated with the quantity of infiltration and expression profiles of hematopoietic samples, while the “stromal” signa-ture is composed of non-hematopoietic genes. With that, a single-sample GSEA (ssGSEA)^5^ is performed to obtain the scores of the signatures, representing how likely the signature is to be enriched in a given sample; and the combination of both scores allows a robust measurement of tumor purity. 
+
+## Libraries
+
+The installation of immunedeconv package included several difficulties I had to overcome. R 4.2.0 was not able to install two dependencies: ComICS and glmnet, the latter being because of an error with a C++ interpreter. To solve that, I had to create a *Makevars* file in .R folder at my directory containing: 
+
+*CXX14 = g++ -std=c++1y -Wno-unused-variable -Wno-unused-function -fPIC* 
+
+Furthermore, I had to create a .bash_profile file with a list of modules in the cluster required for this action:
+
+    if ps -e | grep -q rserver; then
+  module load gdal/3.0.2
+  module load binutils/2.34
+  module load anaconda3/2019.07
+  module load hdf5/1.8.18
+  module load gcc/11.1.0
+  module load libpng/1.6.37
+  module load jags/4.3.0
+  module load freetype/2.10.0
+  module load imagemagick/6.9.12
+  module load cmake/3.21.0
+  module load htslib/1.9
+  fi
+  
+After that, the process was as follows: 
+
+```{r, results="hide", message=FALSE, warning=FALSE}
+# install.packages("remotes")
+# library(remotes)
+# 
+# install.packages("/omics/groups/OE0436/data/jimenez/data/glmnet_4.1-4.tar.gz", type = "source", repos = NULL)
+# 
+# install.packages("/omics/groups/OE0436/data/jimenez/data/ComICS_1.0.4.tar.gz", type = "source", repos = NULL)
+# 
+# 
+# remotes::install_github("omnideconv/immunedeconv")
+```
+
+The libraries needed for the analyses can be found below. 
+
+```{r, results="hide", message=FALSE, warning=FALSE}
+# R version employed for this script is 4.2.0
+library(immunedeconv) # deconvolution package
+library(dplyr) # to manage data
+library(tidyr) # to manage data
+library(ggplot2) # R graphs and images
+library(ggh4x) # complementary to ggplot2
+library(pheatmap) # heatmaps
+library(RColorBrewer) # for graph colors
+library(curl)
+```
+
+## Loading data and filtering genes
+
+For these deconvolution analyses, RNA-seq counts are used. Usually, bulk transcriptomics data is normalized before deconvoluting. Different normalization methodologies have different effects across different deconvolution methods. For some methods, such as EPIC and CIBERSORT, TPM normalization is one of the most effective choices^6^. Thus, TPM counts will be employed for our analyses. 
+
+First of all, data is loaded and set for the analyses.
+
+```{r}
+#TPM counts
+tpm_pre <- read.delim("/omics/groups/OE0436/data/jimenez/data/rnaseq/rnaseq_tpm_met1_protein_coding.tsv")
+colnames(tpm_pre)[1:5] <- sapply(colnames(tpm_pre)[1:5], function(x) gsub("^X", "", x)) # adapt five first PIDs
+
+tpm_post <- read.delim("/omics/groups/OE0436/data/jimenez/data/rnaseq/rnaseq_tpm_met2_protein_coding.tsv")
+colnames(tpm_post)[1:3] <- sapply(colnames(tpm_post)[1:3], function(x) gsub("^X", "", x)) # adapt three first PIDs
+
+# Pheno data with information on treatment and response
+pheno <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/PID_treatment.csv", 
+                  header = TRUE, sep = ";", row.names = "PID")
+pheno_pre <- pheno[colnames(tpm_pre), ] # order the same and filter for those samples we have in RNA-seq data in pre-treatment
+pheno_post <- pheno[colnames(tpm_post), ] # order the same and filter for those samples we have in RNA-seq data in post-treatment
+```
+
+Since in the available samples for RNA-seq data the samples for SD are fewer, two groups including PD and SD in non-responders and PR in responders are considered for comparisons, as done in .... [REFERENCIA].
+
+```{r}
+colnames(pheno_pre) = c("therapy", "evolution") # change names
+colnames(pheno_post) = c("therapy", "evolution") # change names
+
+pheno_pre <- pheno_pre %>% 
+  mutate(response = ifelse(evolution == "PR", "responders", "non-responders"))
+
+pheno_post <- pheno_post %>%
+  mutate(response = ifelse(evolution == "PR", "responders", "non-responders"))
+```
+
+Finally, counts matrices are filtered to remove background transcriptomic noise and genes that are not expressed. First of all, all rows sums must be higher than 10 in order to ensure there is a minimal amount of counts per gene, and second of all, at least 80% of samples per condition must be different to 0 counts. 
+
+```{r}
+# Row sums must be higher than 10 in order to ensure there are enough counts
+tpm_pre <- tpm_pre[rowSums(tpm_pre) > 10, ]
+tpm_post <- tpm_post[rowSums(tpm_post) > 10, ]
+
+cat(dim(tpm_pre)[1], 
+    "genes with more than 10 counts in pre and", dim(tpm_post)[1], "in post")
+
+# Keep genes that have counts in at least 80% of each group
+# Compute number of samples per experimental group and minimum percent
+n.samplespergroup_pre <- table(pheno_pre$response) 
+n.samplespergroup_post <- table(pheno_post$response) 
+percent <- 0.8 # define the 80%
+samples.min_pre <- round(n.samplespergroup_pre*(1-percent), 0) # number of samples that represents the 20%, the maximum amount of 0 allowed
+samples.min_post <- round(n.samplespergroup_post*(1-percent), 0)
+
+# Data frame with the number of 0 in each gene and sample
+pre_0 <- data.frame(row.names = rownames(tpm_pre), 
+                   "non-responders" = rep(0, length(rownames(tpm_pre))), 
+                   "responders" = rep(0, length(rownames(tpm_pre))))
+
+post_0 <- data.frame(row.names = rownames(tpm_post), 
+                   "non-responders" = rep(0, length(rownames(tpm_post))), 
+                   "responders" = rep(0, length(rownames(tpm_post))))
+
+for (i in 1:2){
+  c <- tpm_pre[ , which(colnames(tpm_pre) %in% rownames(pheno_pre[pheno_pre$response == unique(pheno_pre$response)[i], ]))] # subset counts per group
+  how_many_0 <- apply(c, 1, function(x) sum(x == 0)) # compute how many 0 per gene
+  pre_0[, i] <- as.vector(how_many_0)
+}
+
+for (i in 1:2){
+  c <- tpm_post[ , which(colnames(tpm_post) %in% rownames(pheno_post[pheno_post$response == unique(pheno_post$response)[i], ]))] # subset counts per group
+  how_many_0 <- apply(c, 1, function(x) sum(x == 0)) # compute how many 0 per gene
+  post_0[, i] <- as.vector(how_many_0)
+}
+
+# Get genes that have counts in at least 80% of the samples of at least one group
+# Substract the 80% computed for each group to the counts found for each gene, if it is > 0 it means that at least 80% of samples counted that gene
+resta_pre <- apply(pre_0, 1,  function(x) {any(x < as.vector(samples.min_pre))}) 
+resta_post <- apply(post_0, 1,  function(x) {any(x < as.vector(samples.min_post))}) 
+
+idx_80_pre <- rownames(tpm_pre)[which(resta_pre == TRUE)]
+idx_80_post <- rownames(tpm_post)[which(resta_post == TRUE)]
+
+cat(length(idx_80_pre), "out of", dim(tpm_pre)[1], 
+    "genes counted in 80% of the samples of at least one group and", 
+    length(idx_80_post), "out of", dim(tpm_post)[1], "in post")
+
+tpm_pre <- tpm_pre[idx_80_pre, ]
+tpm_post <- tpm_post[idx_80_post, ]
+```
+
+Once we have the matrices filtered, we can apply deconvolution methods.
+
+## Estimation of tumoral components of tumours
+
+The ESTIMATE algorithm of the immunedeconv package computes a score for the tumoral, immune and stromal components and the fraction of tumor purity of a sample.
+
+```{r}
+# Estimation
+estimation_pre <- immunedeconv::deconvolute_estimate(tpm_pre)
+
+estimation_post <- immunedeconv::deconvolute_estimate(tpm_post)
+```
+
+Let's represent these results.
+
+```{r}
+# First of all, transform data into long format for ggplot input
+estimation_pre$scores <- rownames(estimation_pre)
+estimation_pre_gg <- as_tibble(estimation_pre) %>% 
+  pivot_longer(!scores, names_to = "PID", values_to = "abundance") %>% 
+  as.data.frame() %>%
+  mutate(Response = ifelse(PID %in% rownames(pheno_pre)[pheno_pre$response == "responders"], "responders", "non-responders"), Time = rep("pre-treatment", 4*21))
+
+estimation_post$scores <- rownames(estimation_post)
+estimation_post_gg <- as_tibble(estimation_post) %>% 
+  pivot_longer(!scores, names_to = "PID", values_to = "abundance") %>% 
+  as.data.frame() %>%
+  mutate(Response = ifelse(PID %in% rownames(pheno_post)[pheno_post$response == "responders"], "responders", "non-responders"), Time = rep("post-treatment", 4*16))
+
+estimation_all <- rbind(estimation_pre_gg, estimation_post_gg) # merge all
+
+
+# Boxplots
+ggplot(transform(estimation_all[!estimation_all$scores == "ESTIMATEScore", ], 
+                 Time = factor(Time, levels = c("pre-treatment", "post-treatment"))), 
+       aes(x = Response, y = abundance)) + 
+  geom_boxplot(aes(fill = Response), alpha = 2) + geom_point() + 
+  scale_fill_manual(values = c("red", "green")) +
+  theme_bw() + ylab("ESTIMATE scores") + 
+  xlab("") +
+  facet_grid(scores ~ Time, scales = "free_y") +
+  theme(axis.text.x = element_blank(), 
+        strip.background = element_rect(fill = "white", color = "black"),
+        strip.text.x = element_text(size = 12)) + 
+  stat_compare_means(method = "t.test", paired = FALSE, vjust = TRUE, size = 3, label.x = 1.25)
+
+# Barplots
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/deconvolution/immunedeconv_estimation_barplots.pdf")
+
+ggplot(estimation_pre_gg[estimation_pre_gg$scores == "TumorPurity", ], 
+       aes(x = PID, y = abundance*100)) + 
+  # geom_bar(aes(fill = response), stat = "identity", position = "stack") + 
+  geom_bar(stat = "identity", position = "stack", color = "black") +
+  ylab("Estimated tumor purity %") + 
+  xlab("Metastasis1 samples (pre-treatment)") + theme_bw()  + 
+  facet_wrap(~Response, scales = "free_x", strip.position = "top") +
+  theme(axis.text.x = element_text(angle = 60, size = 10, hjust = 1), 
+        strip.text.x = element_text(size = 10),
+        strip.background = element_rect(fill = "white", color = "black"))
+
+ggplot(estimation_post_gg[estimation_post_gg$scores == "TumorPurity", ], 
+       aes(x = PID, y = abundance*100)) + 
+  # geom_bar(aes(fill = response), stat = "identity", position = "stack") + 
+  geom_bar(stat = "identity", position = "stack", color = "black") +
+  ylab("Estimated tumor purity %") + 
+  xlab("Metastasis2 samples (post-treatment)") + theme_bw()  + 
+  facet_wrap(~Response, scales = "free_x", strip.position = "top") +
+  theme(axis.text.x = element_text(angle = 60, size = 10, hjust = 1), 
+        strip.text.x = element_text(size = 10),
+        strip.background = element_rect(fill = "white", color = "black"))
+
+
+ggplot(estimation_pre_gg[!(estimation_pre_gg$scores == "TumorPurity" | estimation_pre_gg$scores == "ESTIMATEScore"), ], 
+       aes(x = PID, y = abundance)) + 
+  geom_bar(aes(fill = scores), stat = "identity", position = "stack") + 
+  ylab("Estimated abundance of tumoral components") + 
+  xlab("Metastasis1 samples (pre-treatment)") + theme_bw()  + 
+  facet_wrap(~Response, scales = "free_x", strip.position = "top") +
+  theme(axis.text.x = element_text(angle = 60, size = 10, hjust = 1), 
+        strip.text.x = element_text(size = 10),
+        strip.background = element_rect(fill = "white", color = "black"))
+
+ggplot(estimation_post_gg[!(estimation_post_gg$scores == "TumorPurity" | estimation_post_gg$scores == "ESTIMATEScore"), ], 
+       aes(x = PID, y = abundance)) + 
+  geom_bar(aes(fill = scores), stat = "identity", position = "stack") + 
+  ylab("Estimated abundance of tumoral components") + 
+  xlab("Metastasis2 samples (post-treatment)") + theme_bw()  + 
+  facet_wrap(~Response, scales = "free_x", strip.position = "top") +
+  theme(axis.text.x = element_text(angle = 60, size = 10, hjust = 1), 
+        strip.text.x = element_text(size = 10),
+        strip.background = element_rect(fill = "white", color = "black"))
+
+dev.off()
+```
+
+With these results in the estimation of tumoral components, statistical analyses are also performed. 
+
+
+```{r}
+# Comparison of infiltrated populations pre-non-responders vs. pre-responders
+# Prepare data
+estimation_pre <- as.data.frame(t(estimation_pre[,-22])) %>% 
+  mutate(response = pheno_pre$response)
+
+# Previous comprovations
+shapiro_pre <- apply(estimation_pre[,-5], 2 , function(x) shapiro.test(x)$p.value) # normality
+var_pre <- apply(estimation_pre[,-5], 2, function(x) var.test(x ~ estimation_pre$response)$p.value) # homocedasticity
+
+# Tests 
+comparison_estimation_pre <- data.frame(row.names = colnames(estimation_pre[,-5]),
+                         "pvalue" = rep(0, 4))
+
+
+for (i in 1:4){
+  if (shapiro_pre[[i]] < 0.05){
+    test <- wilcox.test(estimation_pre[,i] ~ estimation_pre$response)
+    comparison_estimation_pre$pvalue[i] <- test$p.value
+  }else{
+    if (var_pre[[i]] < 0.05){
+      test <- t.test(estimation_pre[,i] ~ estimation_pre$response,
+                     paired = FALSE, 
+                     mu = 0, conf.level = 0.95, var.equal = F)
+      comparison_estimation_pre$pvalue[i] <- test$p.value
+    }else{
+      test <- t.test(estimation_pre[,i] ~ estimation_pre$response,
+                     paired = FALSE, 
+                     mu = 0, conf.level = 0.95, var.equal = T)
+      comparison_estimation_pre$pvalue[i] <- test$p.value
+    }
+  }
+}
+
+comparison_estimation_pre$padjusted <- p.adjust(comparison_estimation_pre$pvalue, method = "fdr")
+```
+
+No differences seen. 
+
+```{r}
+# Comparison of infiltrated populations pre-non-responders vs. pre-responders
+# Prepare data
+estimation_post <- as.data.frame(t(estimation_post[,-17])) %>% 
+  mutate(response = pheno_post$response)
+
+# Previous comprovations
+shapiro_post <- apply(estimation_post[,-5], 2 , function(x) shapiro.test(x)$p.value) # normality
+var_post <- apply(estimation_post[,-5], 2, function(x) var.test(x ~ estimation_post$response)$p.value) # homocedasticity
+
+# Tests 
+comparison_estimation_post <- data.frame(row.names = colnames(estimation_post[,-5]),
+                         "pvalue" = rep(0, 4))
+
+
+for (i in 1:4){
+  if (shapiro_post[[i]] < 0.05){
+    test <- wilcox.test(estimation_post[,i] ~ estimation_post$response)
+    comparison_estimation_post$pvalue[i] <- test$p.value
+  }else{
+    if (var_post[[i]] < 0.05){
+      test <- t.test(estimation_post[,i] ~ estimation_post$response,
+                     paired = FALSE, 
+                     mu = 0, conf.level = 0.95, var.equal = F)
+      comparison_estimation_post$pvalue[i] <- test$p.value
+    }else{
+      test <- t.test(estimation_post[,i] ~ estimation_post$response,
+                     paired = FALSE, 
+                     mu = 0, conf.level = 0.95, var.equal = T)
+      comparison_estimation_post$pvalue[i] <- test$p.value
+    }
+  }
+}
+
+comparison_estimation_post$padjusted <- p.adjust(comparison_estimation_post$pvalue, method = "fdr")
+
+# Save tables 
+write.table(estimation_pre, file = "/omics/groups/OE0436/data/jimenez/outputs/rnaseq/deconvolution/estimation_pre.tsv", 
+            sep = "\t", col.names = TRUE, row.names = TRUE)
+
+write.table(estimation_post, file = "/omics/groups/OE0436/data/jimenez/outputs/rnaseq/deconvolution/estimation_post.tsv", 
+            sep = "\t", col.names = TRUE, row.names = TRUE)
+```
+
+We can see all components in post-treatment samples differ. However, a special focus must be put in tumor purity as an indicator for further comparisons. That is, since tumor purity is significantly reduced in post-treatment responder samples, comparisons with pre-post and post-post are influenced by the fact we are not comparing with the same tumor compositions. 
+
+Cell deconvolution may be performed.
+
+## Immunedeconv deconvolution
+
+*It was not performed. To use CIBERSORT in this package, the R source code has to be included. For that, you have to create an account and receive the license in CIBERSORT. I contacted them to see if they could send me the source code (once I had my license and account) and they told me they were working on uploading it in the web so that everbybody could access...
+
+Deconvolution will be performed only with pre-treatment samples due to the findings of the previous section. Out of the ten methods available, Cibersort will be tested. 
+
+```{r}
+# To use CIBERSORT we need to set the code of the program 
+set_cibersort_binary("/omics/groups/OE0436/data/jimenez/data/CIBERSORT.R")
+set_cibersort_mat("/omics/groups/OE0436/data/jimenez/data/LM22.txt")
+
+# Deconvolution with CIBERSORT
+cibersort_pre <- immunedeconv::deconvolute(as.matrix(tpm_pre), method = "cibersort")
+
+cibersort_post <- immunedeconv::deconvolute(tpm_post, "cibersort")
+
+```
+
+
+## Bibliography
+1. Fridman, W. H., Pagès, F., Saut̀s-Fridman, C. & Galon, J. The immune contexture in human tu-mours: impact on clinical outcome. Nature Re-views Cancer 2012 12:4 12, 298–306 (2012).
+2. Avila Cobos, F., Vandesompele, J., Mestdagh, P. & de Preter, K. Computational deconvolution of transcriptomics data from mixed cell popula-tions. Bioinformatics 34, 1969–1979 (2018).
+3. Yoshihara, K. et al. Inferring tumour purity and stromal and immune cell admixture from ex-pression data. Nature Communications 2013 4:1 4, 1–11 (2013).
+4. Sturm, G., Finotello, F. & List, M. Im-munedeconv: An R package for unified access to computational methods for estimating im-mune cell fractions from bulk RNA-sequencing data. Methods in Molecular Biology 2120, 223–232 (2020).
+5. Becht, E. et al. Estimating the population abundance of tissue-infiltrating immune and stromal cell populations using gene expression. Ge-nome Biol 17, 1–20 (2016).
+6. Gibney, G. T., Weiner, L. M., Michael, P. & At-kins, B. Predictive biomarkers for checkpoint inhibitor-based immunotherapy. doi:10.1016/S1470-2045(16)30406-5 (2016). 

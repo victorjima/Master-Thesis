@@ -1,0 +1,10 @@
+##################### HOW TO RUN MUTSIG #################
+For mutsig usage, two modules are required:
+module load mcr/9.0.1
+module load mutsig/1.41
+
+/software/mutsig/1.41/bin/run_MutSigCV.sh <deployedMCRroot> 
+
+/software/mutsig/1.41/bin/run_MutSigCV.sh <here MCR root should be defined> /omics/groups/OE0436/data/jimenez/data/snv_indels.maf \
+/omics/groups/OE0436/data/jimenez/data/MutSig/exome_full192.coverage.txt \
+/omics/groups/OE0436/data/jimenez/data/MutSig/gene.covariates.txt /omics/groups/OE0436/data/jimenez/outputs

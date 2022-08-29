@@ -1,0 +1,2 @@
+# Master-Thesis
+This GitHub repository contains Supplementary Information (scripts and supplementary data files) belonging to my Master thesis "Omic characterization of melanoma for the identification of potential biomarkers in response to immune checkpoint inhibitors", carried out in the context of the MSc Omics Data Science (University of Vic) at the Division of Applied Bioinformatics in the German Cancer Research Center.

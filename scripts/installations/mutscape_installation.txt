@@ -1,0 +1,44 @@
+The modules required for the installation of this tool in the cluster were:
+module load miniconda/4.9.2
+
+Python is required for the usage of this tool. But loading miniconda along with miniconda might give errors, so python may be installed within the environment:
+conda install python=3.7.0
+
+The installation of MutScape has been carried out with the following commands:
+
+Clone the git repository with all the files and scripts required
+git clone https://github.com/anitalu724/MutScape.git
+
+Move to the correspondent folder:
+cd MutScape/mutscape
+
+For its usage, a new conda environment is recommended to be created, with these commands:
+bash
+conda init
+conda create -p /omics/groups/OE0436/data/jimenez/tools/MutScape/MutScape/mutscape
+conda activate /omics/groups/OE0436/data/jimenez/tools/MutScape/MutScape/mutscape
+
+Install some dependencies:
+conda install -c bioconda -c conda-forge samtools=1.10 ucsc-liftover=377 bcftools=1.10.2 htslib==1.10.2
+conda install -c bioconda -c conda-forge -c defaults ensembl-vep=102.0
+
+That way, the installation module must be run:
+bash installation/install_module.sh
+
+Change permision in MutScape python scripts
+chmod +x dataPreprocess.py mafAnalysis.py
+
+Export paths
+export LD_LIBRARY_PATH=/omics/groups/OE0436/data/jimenez/tools/MutScape/MutScape/mutscape/lib/:$LD_LIBRARY_PATH
+
+export PATH=/omics/groups/OE0436/data/jimenez/tools/MutScape/MutScape/mutscape/:$PATH
+
+MutScape actually depends on another tool: oncodriveclust. To install it: 
+pip install oncodriveclust
+
+If the MutScape code is run and errors appear indicating that a given python module is not found, it should be installed:
+pip install package 
+
+
+More information in installation and usage can be found at:
+https://github.com/anitalu724/MutScape

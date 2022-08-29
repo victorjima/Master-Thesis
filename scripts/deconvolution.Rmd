@@ -1,0 +1,817 @@
+---
+title: <span style="font-family:Georgia;">Deconvolution analyses</span>
+author: "Víctor Jiménez Martínez"
+date: "2022"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Introduction
+
+Infiltration of immune cells in the tumor bed may be in-formative for the immune state of the tumor and for the pre-diction of response to therapy, as discussed above. In that sense, traditionally techniques such as immunohistochemistry, immunofluorescence and flow cytometry have been em-ployed to characterize immune infiltrates^1^. However, the development of deconvolution tools allows the estimation of abundances of cell types from RNAseq bulk expression data by modelling gene expression levels as weighted sums of the cell-type specific expression profiles^2^. Several computational methods have been developed to this date. 
+
+The main goal is to estimate the abundances of different immune populations across our samples and compare the differences between different conditions (responsive vs. non-responsive and pre-treatment vs. post-treatment)
+
+For deconvolution of immune cell populations in our co-hort across different groups, Microenvironment Cell Popula-tions Counter (MCPCounter)^3^ R package was used. The pre-dictions are based on transcriptomics markers (TM), that is, genes expressed only in a single cell type. That way, the ex-pression of a given TM is proportional to the abundance of the cell type. Scores of cell types are computed as a log2 geomet-ric mean of the expression values of its TMs as a score, and represents an inter-sample relative abundance of the different cell populations. MCPCounter has shown robust results and high correlation with true cell fractions. Although the package includes a set of TM for 10 immune cell populations, for this study a compendium of 782 genes characterizing 28 immune cell populations^4^ was used for a more detailed insight into the immune infiltration of our samples. 
+
+## Libraries
+
+Libraries needed for the analysis are loaded below.
+
+```{r, results="hide", message=FALSE, warning=FALSE}
+# R version employed for this script is 4.2.0
+# library(devtools)
+# install_github("ebecht/MCPcounter",ref="master", subdir="Source") # to install MCPcounter tool
+library(MCPcounter) # deconvolution package
+# library(granulator) # installation does not work either in R version 4.1.0 or 4.2.0
+library(dplyr) # to manage data
+library(tidyr) # to manage data
+library(ggplot2) # R graphs and images
+library(ggh4x) # complementary to ggplot2
+library(pheatmap) # heatmaps
+library(RColorBrewer) # for graph colors
+library(curl)
+library(ComplexHeatmap)
+```
+
+## Loading data and filtering genes
+
+For these deconvolution analyses, RNA-seq counts are used. Usually, bulk transcriptomics data is normalized before deconvoluting. Different normalization methodologies have different effects across different deconvolution methods. For some methods, such as EPIC and CIBERSORT, TPM normalization is one of the most effective choices^5^. Thus, TPM counts will be employed for our analyses. 
+
+First of all, data is loaded and set for the analyses.
+
+```{r}
+#TPM counts
+tpm_pre <- read.delim("/omics/groups/OE0436/data/jimenez/data/rnaseq/rnaseq_tpm_met1_protein_coding.tsv")
+colnames(tpm_pre)[1:5] <- sapply(colnames(tpm_pre)[1:5], function(x) gsub("^X", "", x)) # adapt five first PIDs
+
+tpm_post <- read.delim("/omics/groups/OE0436/data/jimenez/data/rnaseq/rnaseq_tpm_met2_protein_coding.tsv")
+colnames(tpm_post)[1:3] <- sapply(colnames(tpm_post)[1:3], function(x) gsub("^X", "", x)) # adapt three first PIDs
+
+# Pheno data with information on treatment and response
+pheno <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/PID_treatment.csv", 
+                  header = TRUE, sep = ";", row.names = "PID")
+pheno_pre <- pheno[colnames(tpm_pre), ] # order the same and filter for those samples we have in RNA-seq data in pre-treatment
+pheno_post <- pheno[colnames(tpm_post), ] # order the same and filter for those samples we have in RNA-seq data in post-treatment
+```
+
+Set PR and SD as responders and PD as non-responders.
+
+```{r}
+colnames(pheno_pre) = c("therapy", "evolution") # change names
+colnames(pheno_post) = c("therapy", "evolution") # change names
+
+pheno_pre <- pheno_pre %>% 
+  mutate(response = ifelse(evolution == "PR", "responders", "non-responders"))
+
+pheno_post <- pheno_post %>%
+  mutate(response = ifelse(evolution == "PR", "responders", "non-responders"))
+```
+
+Finally, counts matrices are filtered to remove background transcriptomic noise and genes that are not expressed. First of all, all rows sums must be higher than 10 in order to ensure there is a minimal amount of expression per gene, and second of all, at least 80% of samples per condition must be different to 0 counts. 
+
+```{r}
+# Row sums must be higher than 10 in order to ensure there are enough counts
+tpm_pre <- tpm_pre[rowSums(tpm_pre) > 10, ]
+tpm_post <- tpm_post[rowSums(tpm_post) > 10, ]
+
+cat(dim(tpm_pre)[1], 
+    "genes with more than 10 counts in pre and", dim(tpm_post)[1], "in post")
+
+# Keep genes that have counts in at least 80% of each group
+# Compute number of samples per experimental group and minimum percent
+n.samplespergroup_pre <- table(pheno_pre$response) 
+n.samplespergroup_post <- table(pheno_post$response) 
+percent <- 0.8 # define the 80%
+samples.min_pre <- round(n.samplespergroup_pre*(1-percent), 0) # number of samples that represents the 20%, the maximum amount of 0 allowed
+samples.min_post <- round(n.samplespergroup_post*(1-percent), 0)
+
+# Data frame with the number of 0 in each gene and sample
+pre_0 <- data.frame(row.names = rownames(tpm_pre), 
+                   "non-responders" = rep(0, length(rownames(tpm_pre))), 
+                   "responders" = rep(0, length(rownames(tpm_pre))))
+
+post_0 <- data.frame(row.names = rownames(tpm_post), 
+                   "non-responders" = rep(0, length(rownames(tpm_post))), 
+                   "responders" = rep(0, length(rownames(tpm_post))))
+
+for (i in 1:2){
+  c <- tpm_pre[ , which(colnames(tpm_pre) %in% rownames(pheno_pre[pheno_pre$response == unique(pheno_pre$response)[i], ]))] # subset counts per group
+  how_many_0 <- apply(c, 1, function(x) sum(x == 0)) # compute how many 0 per gene
+  pre_0[, i] <- as.vector(how_many_0)
+}
+
+for (i in 1:2){
+  c <- tpm_post[ , which(colnames(tpm_post) %in% rownames(pheno_post[pheno_post$response == unique(pheno_post$response)[i], ]))] # subset counts per group
+  how_many_0 <- apply(c, 1, function(x) sum(x == 0)) # compute how many 0 per gene
+  post_0[, i] <- as.vector(how_many_0)
+}
+
+# Get genes that have counts in at least 80% of the samples of at least one group
+# Substract the 80% computed for each group to the counts found for each gene, if it is > 0 it means that at least 80% of samples counted that gene
+resta_pre <- apply(pre_0, 1,  function(x) {any(x < as.vector(samples.min_pre))}) 
+resta_post <- apply(post_0, 1,  function(x) {any(x < as.vector(samples.min_post))}) 
+
+idx_80_pre <- rownames(tpm_pre)[which(resta_pre == TRUE)]
+idx_80_post <- rownames(tpm_post)[which(resta_post == TRUE)]
+
+cat(length(idx_80_pre), "out of", dim(tpm_pre)[1], 
+    "genes counted in 80% of the samples of at least one group and", 
+    length(idx_80_post), "out of", dim(tpm_post)[1], "in post")
+
+tpm_pre <- tpm_pre[idx_80_pre, ]
+tpm_post <- tpm_post[idx_80_post, ]
+```
+
+Once we have the matrices filtered, we can apply deconvolution methods.
+
+## MCPCounter Deconvolution 
+First of all, the reference sets for deconvolution of immune cell populations are loaded. On one hand, the ones provided by the package are included, with a total of 10 immune cell populations to be estimated. On the other hand, a set with 28 immune cell populations defined by [] is also used.
+
+```{r}
+# Gene matrixs and cell populations provided by the package
+probesets <- read.table(curl("http://raw.githubusercontent.com/ebecht/MCPcounter/master/Signatures/probesets.txt"),sep="\t",stringsAsFactors=FALSE,colClasses="character")
+
+genes <- read.table(curl("http://raw.githubusercontent.com/ebecht/MCPcounter/master/Signatures/genes.txt"),sep="\t",stringsAsFactors=FALSE,header=TRUE,colClasses="character",check.names=FALSE)               
+# Metagene approach with a set of pan-cancer metagenes for 28 immune cell subpopulations 
+immune_genes <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/pan_cancer_immune_metagenes.csv", 
+                         header = TRUE, sep = ";")
+immune_genes <- immune_genes[, c(1,2)]
+colnames(immune_genes) <- c("HUGO symbols", "Cell population")
+
+# Our rownames genes are in symbols, so I check if it can be used with HUGO gene symbol from the package
+sum(genes$`HUGO symbols`%in% rownames(tpm_pre))
+sum(immune_genes$`HUGO symbols`%in% rownames(tpm_pre))
+
+sum(genes$`HUGO symbols`%in% rownames(tpm_post))
+sum(immune_genes$`HUGO symbols`%in% rownames(tpm_post))
+```
+
+Since most of genes in our reference sets are included in our matrices, deconvolution is performed. The MCPCounter function will output a matrix with the estimated abundance score for each cell population. 
+
+```{r}
+# Deconvolution with the 10 immune populations
+mcp_decon_pre <- as.data.frame(MCPcounter.estimate(tpm_pre,
+                                 featuresType = "HUGO_symbols",
+                                 probesets = probesets,
+                                 genes = genes))
+
+mcp_decon_post <- as.data.frame(MCPcounter.estimate(tpm_post,
+                                 featuresType = "HUGO_symbols",
+                                 probesets = probesets,
+                                 genes = genes))
+
+# Deconvolution with the 28 immune populations
+mcp_decon_immune_pre <- as.data.frame(MCPcounter.estimate(tpm_pre,
+                                               featuresType = "HUGO_symbols",
+                                               # probesets = probesets,
+                                               genes = immune_genes))
+
+mcp_decon_immune_post <- as.data.frame(MCPcounter.estimate(tpm_post,
+                                               featuresType = "HUGO_symbols",
+                                               # probesets = probesets,
+                                               genes = immune_genes))
+```
+
+These results are visualized with barplots.
+
+```{r}
+# First of all, transform data into long format for ggplot input
+mcp_decon_pre$cell_population <- rownames(mcp_decon_pre)
+mcp_decon_pre_gg <- as_tibble(mcp_decon_pre) %>% 
+  pivot_longer(!cell_population, names_to = "PID", values_to = "abundance") %>% 
+  as.data.frame() %>%
+  mutate(response = ifelse(PID %in% rownames(pheno_pre)[pheno_pre$response == "responders"], "responders", "non-responders"))
+
+mcp_decon_immune_pre$cell_population <- rownames(mcp_decon_immune_pre)
+mcp_decon_immune_pre_gg <- as_tibble(mcp_decon_immune_pre) %>% 
+  pivot_longer(!cell_population, names_to = "PID", values_to = "abundance") %>% 
+  as.data.frame() %>%
+  mutate(response = ifelse(PID %in% rownames(pheno_pre)[pheno_pre$response == "responders"], "responders", "non-responders"))
+
+mcp_decon_post$cell_population <- rownames(mcp_decon_post)
+mcp_decon_post_gg <- as_tibble(mcp_decon_post) %>% 
+  pivot_longer(!cell_population, names_to = "PID", values_to = "abundance") %>% 
+  as.data.frame() %>%
+  mutate(response = ifelse(PID %in% rownames(pheno_post)[pheno_post$response == "responders"], "responders", "non-responders"))
+
+mcp_decon_immune_post$cell_population <- rownames(mcp_decon_immune_post)
+mcp_decon_immune_post_gg <- as_tibble(mcp_decon_immune_post) %>% 
+  pivot_longer(!cell_population, names_to = "PID", values_to = "abundance") %>% 
+  as.data.frame() %>%
+  mutate(response = ifelse(PID %in% rownames(pheno_post)[pheno_post$response == "responders"], "responders", "non-responders"))
+
+# Barplots
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/deconvolution/MCPCounter_barplots.pdf")
+
+ggplot(mcp_decon_pre_gg, aes(x = PID, y = abundance)) + 
+  geom_bar(aes(fill = cell_population), stat = "identity", position = "stack") + 
+  ylab("Estimated abundance") + 
+  xlab("Metastasis1 samples (pre-treatment)") + theme_bw()  + 
+  facet_wrap(~response, scales = "free_x", strip.position = "top") +
+  theme(axis.text.x = element_text(angle = 60, size = 10, hjust = 1), 
+        strip.text.x = element_text(size = 10),
+        strip.background = element_rect(fill = "white", color = "black"))
+
+
+ggplot(mcp_decon_immune_pre_gg, aes(x = PID, y = abundance)) + 
+  geom_bar(aes(fill = cell_population), stat = "identity", position = "stack") + 
+  ylab("Estimated abundance") + 
+  xlab("Metastasis1 samples (pre-treatment)") + theme_bw()  + 
+  facet_wrap(~response, scales = "free_x", strip.position = "top") +
+  theme(axis.text.x = element_text(angle = 60, size = 10, hjust = 1), 
+        strip.text.x = element_text(size = 10),
+        strip.background = element_rect(fill = "white", color = "black"))
+
+ggplot(mcp_decon_post_gg, aes(x = PID, y = abundance)) + 
+  geom_bar(aes(fill = cell_population), stat = "identity", position = "stack") + 
+  ylab("Estimated abundance") + 
+  xlab("Metastasis2 samples (post-treatment)") + theme_bw()  + 
+  facet_wrap(~response, scales = "free_x", strip.position = "top") +
+  theme(axis.text.x = element_text(angle = 60, size = 10, hjust = 1), 
+        strip.text.x = element_text(size = 10),
+        strip.background = element_rect(fill = "white", color = "black"))
+
+
+ggplot(mcp_decon_immune_post_gg, aes(x = PID, y = abundance)) + 
+  geom_bar(aes(fill = cell_population), stat = "identity", position = "stack") + 
+  ylab("Estimated abundance") + 
+  xlab("Metastasis2 samples (post-treatment)") + theme_bw()  + 
+  facet_wrap(~response, scales = "free_x", strip.position = "top") +
+  theme(axis.text.x = element_text(angle = 60, size = 10, hjust = 1), 
+        strip.text.x = element_text(size = 10),
+        strip.background = element_rect(fill = "white", color = "black"))
+
+dev.off()
+
+# All together
+mcp_decon_immune_gg_all <- rbind(mcp_decon_immune_pre_gg %>% mutate(Time = rep("pre-treatment", nrow(mcp_decon_immune_pre_gg))),
+      mcp_decon_immune_post_gg %>% mutate(Time = rep("post-treatment", nrow(mcp_decon_immune_post_gg))))
+
+ggplot(transform(mcp_decon_immune_gg_all, Time = factor(Time, levels = c("pre-treatment", "post-treatment"))), 
+       aes(x = PID, y = abundance)) + 
+  geom_bar(aes(fill = cell_population), stat = "identity", position = "stack") + 
+  ylab("Estimated relative abundance") + 
+  xlab("Samples") +
+  facet_grid(~ Time ~ response, scales = "free_x") +
+  theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                     strip.background = element_rect(fill = "white", color = "black"))
+```
+
+## Descriptive analysis 
+
+A PCA is performed to see the clustering of the different samples according to the estimated abundance of immunce cell populations. 
+
+```{r}
+# Compute PCA
+pca_mcp_pre <- prcomp(t(mcp_decon_pre[,-22]), retx=TRUE, center=TRUE, scale=FALSE)
+summary(pca_mcp_pre)$importance[,c(1,2)]
+
+pca_mcp_immune_pre <- prcomp(t(mcp_decon_immune_pre[,-22]), retx=TRUE, center=TRUE, scale=FALSE)
+summary(pca_mcp_immune_pre)$importance[,c(1,2)]
+
+pca_mcp_post <- prcomp(t(mcp_decon_post[,-17]), retx=TRUE, center=TRUE, scale=FALSE)
+summary(pca_mcp_post)$importance[,c(1,2)]
+
+pca_mcp_immune_post <- prcomp(t(mcp_decon_immune_post[,-17]), retx=TRUE, center=TRUE, scale=FALSE)
+summary(pca_mcp_immune_post)$importance[,c(1,2)]
+
+# Scores data
+scores_pre <- as.data.frame(pca_mcp_pre$x[, c("PC1", "PC2")]) # loading coeficients
+scores_immune_pre <- as.data.frame(pca_mcp_immune_pre$x[, c("PC1", "PC2")]) # loading coeficients
+scores_post <- as.data.frame(pca_mcp_post$x[, c("PC1", "PC2")]) # loading coeficients
+scores_immune_post <- as.data.frame(pca_mcp_immune_post$x[, c("PC1", "PC2")]) # loading coeficients
+
+# Add the response to the scores data frame
+scores_pre$Response <- pheno_pre$response 
+scores_immune_pre$Response <- pheno_pre$response 
+scores_post$Response <- pheno_post$response 
+scores_immune_post$Response <- pheno_post$response 
+
+# Plot
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/deconvolution/pca_mcp_immune.pdf")
+
+scores.plot_pre <- ggplot(data = scores_pre, 
+                      aes(x = PC1, 
+                          y = PC2, colour = Response, 
+                          label = rownames(scores_pre))) + 
+  geom_point(alpha = I(0.7), size = 4) + 
+  geom_hline(yintercept = 0)+
+  geom_vline(xintercept = 0)+
+  xlab(paste0("PC1 (", round(summary(pca_mcp_pre)$importance[2,1], 2) * 100, "%)"))+
+  ylab(paste0("PC2 (", round(summary(pca_mcp_pre)$importance[2,2], 2) * 100, "%)"))+
+  stat_ellipse() + ggtitle("MCPCounter deconvolution in pre-treatment samples") +
+  theme_bw()
+
+scores.plot_pre
+
+scores.plot_immune_pre <- ggplot(data = scores_immune_pre, 
+                      aes(x = PC1, 
+                          y = PC2, colour = Response, 
+                          label = rownames(scores_immune_pre))) + 
+  geom_point(alpha = I(0.7), size = 4) + 
+  geom_hline(yintercept = 0)+
+  geom_vline(xintercept = 0)+
+  xlab(paste0("PC1 (", round(summary(pca_mcp_immune_pre)$importance[2,1], 2) * 100, "%)"))+
+  ylab(paste0("PC2 (", round(summary(pca_mcp_immune_pre)$importance[2,2], 2) * 100, "%)"))+
+  stat_ellipse() + scale_color_manual(values = c("red", "green")) +
+  ggtitle("PCA with MCPCounter deconvolution in pre-treatment samples with 28 immune cell populations") +
+  theme_bw()
+
+scores.plot_immune_pre
+
+scores.plot_post <- ggplot(data = scores_post, 
+                      aes(x = PC1, 
+                          y = PC2, colour = Response, 
+                          label = rownames(scores_post))) + 
+  geom_point(alpha = I(0.7), size = 4) + 
+  geom_hline(yintercept = 0)+
+  geom_vline(xintercept = 0)+
+  xlab(paste0("PC1 (", round(summary(pca_mcp_post)$importance[2,1], 2) * 100, "%)"))+
+  ylab(paste0("PC2 (", round(summary(pca_mcp_post)$importance[2,2], 2) * 100, "%)"))+
+  stat_ellipse() + ggtitle("MCPCounter deconvolution in post-treatment samples") +
+  theme_bw()
+
+scores.plot_post
+
+scores.plot_immune_post <- ggplot(data = scores_immune_post, 
+                      aes(x = PC1, 
+                          y = PC2, colour = Response, 
+                          label = rownames(scores_immune_post))) + 
+  geom_point(alpha = I(0.7), size = 4) + 
+  geom_hline(yintercept = 0)+
+  geom_vline(xintercept = 0)+
+  xlab(paste0("PC1 (", round(summary(pca_mcp_immune_post)$importance[2,1], 2) * 100, "%)"))+
+  ylab(paste0("PC2 (", round(summary(pca_mcp_immune_post)$importance[2,2], 2) * 100, "%)"))+
+  stat_ellipse() +  scale_color_manual(values = c("red", "green")) +
+  ggtitle("PCA with MCPCounter deconvolution in post-treatment samples with 28 immune cell populations") +
+  theme_bw()
+
+scores.plot_immune_post
+
+dev.off()
+```
+
+Roughly speaking, there does not seem to be any clustering according to response of treatment due to the estimated cell populations, both with the MCPCounter set and the 28 populations one. As for post-treatment samples, clustering seems stronger, but PR samples are extremely dispersed and there are only three of them. 
+
+Now, heatmaps are performed to see if there are any patterns in cell populations across groups. 
+
+```{r}
+# Estimations heatmap with immune cell populations
+response_pre <- data.frame(row.names = rownames(scores_pre), "Response" = scores_pre$Response)
+response_immune_pre <- data.frame(row.names = rownames(scores_immune_pre), "Response" = scores_immune_pre$Response)
+response_post <- data.frame(row.names = rownames(scores_post), "Response" = scores_post$Response)
+response_immune_post <- data.frame(row.names = rownames(scores_immune_post), "Response" = scores_immune_post$Response)
+
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/deconvolution/heatmap_ES_mcp_immune.pdf")
+
+pheatmap(as.matrix(mcp_decon_pre[,-22]), scale = "row",
+         annotation_col = response_pre,
+         cluster_rows = FALSE,
+         show_rownames = TRUE, show_colnames = TRUE,
+         annotation_legend = TRUE, annotation_names_col = FALSE)
+
+pheatmap(as.matrix(mcp_decon_immune_pre[,-22][, order(pheno_pre$response)]), 
+         scale = "row",
+         annotation_col = response_pre,
+         annotation_colors = list(Response= c(`non-responders` = "red", responders= "green")),
+         cluster_rows = FALSE, show_rownames = TRUE, show_colnames = TRUE, cluster_cols = FALSE,
+         annotation_legend = TRUE, annotation_names_col = FALSE,
+         name = "MCPCounter estimated relative abundance")
+
+pheatmap(as.matrix(mcp_decon_post[,-17]), scale = "row",
+         annotation_col = response_post,
+         cluster_rows = FALSE,
+         show_rownames = TRUE, show_colnames = TRUE,
+         annotation_legend = TRUE, annotation_names_col = FALSE)
+
+pheatmap(as.matrix(mcp_decon_immune_post[,-17][, order(pheno_post$response)]), 
+         scale = "row",
+         annotation_col = response_post,
+         annotation_colors = list(Response= c(`non-responders` = "red", responders= "green")),
+         cluster_rows = FALSE, show_rownames = TRUE, show_colnames = TRUE, cluster_cols = FALSE,
+         annotation_legend = TRUE, annotation_names_col = FALSE,
+         name = "MCPCounter estimated relative abundance")
+
+dev.off() 
+
+# Complex heatmap 
+tpm_pre_immune <- tpm_pre[immune_genes[which(immune_genes$`HUGO symbols` %in% rownames(tpm_pre)), 1],]
+
+# Select those samples that are in the plot
+group_pre <- pheno_pre$response
+                     
+order_column <- order(group_pre)
+
+ComplexHeatmap::Heatmap(as.matrix(tpm_pre_immune), name = "Expression (TPM)",
+                        column_order = order_column,
+                        column_title = "Metastasis1 samples (pre-treatment)",
+                        column_title_side = "bottom",
+                        show_row_names = FALSE,
+                        show_row_dend = FALSE, row_dend_side = "right",
+                        show_column_dend = FALSE,
+                        row_split = immune_genes[which(immune_genes$`HUGO symbols` %in%
+                                                         rownames(tpm_pre)), 2],
+                        row_title_rot = 0, row_title_gp = gpar(size = 5),
+                        bottom_annotation = HeatmapAnnotation(Response = group_pre,
+                                                               show_annotation_name = FALSE,
+                                                              col = list(Response = c(
+                                            `responders` = "green",
+                                            `non-responders` = "red"))))
+```
+
+In post-treatment estimations, there seems to be a pattern showing an increase in almost all populations in PR with regard to PD, something that cannot be seen in pre-treatment samples. It might be showing that the response to therapy triggers immune infiltration in the tumor microenvironment to kill cancer cells. 
+
+## Statistical analyses
+
+To finally see if there are any significant differences in immune cell populations between PR and PD samples, statistical tests are performed to compare pre-PR vs. pre-PD, post-PR vs. post-PD, pre-PR vs. post-PR and pre-PD vs. post-PD.
+
+```{r}
+# Comparison of infiltrated populations pre-non-responders vs. pre-responders
+# Prepare data
+mcp_decon_pre <- as.data.frame(t(mcp_decon_pre[,-22])) %>% 
+  mutate(response = pheno_pre$response)
+
+mcp_decon_immune_pre <- as.data.frame(t(mcp_decon_immune_pre[,-22])) %>% 
+  mutate(response = pheno_pre$response)
+
+# Previous comprovations
+shapiro_pre <- apply(mcp_decon_pre[,-11], 2 , function(x) shapiro.test(x)$p.value) # normality
+var_pre <- apply(mcp_decon_pre[,-11], 2, function(x) var.test(x ~ mcp_decon_pre$response)$p.value) # homocedasticity
+
+shapiro_immune_pre <- apply(mcp_decon_immune_pre[,-29], 2 , function(x) shapiro.test(x)$p.value) # normality
+var_immune_pre <- apply(mcp_decon_immune_pre[,-29], 2, function(x) var.test(x ~ mcp_decon_immune_pre$response)$p.value) # homocedasticity
+
+# Tests 
+comparison_pre <- data.frame(row.names = colnames(mcp_decon_pre[,-11]),
+                         "pvalue" = rep(0, 10))
+
+comparison_immune_pre <- data.frame(row.names = colnames(mcp_decon_immune_pre[,-29]),
+                         "pvalue" = rep(0, 28))
+
+
+for (i in 1:10){
+  if (shapiro_pre[[i]] < 0.05){
+    test <- wilcox.test(mcp_decon_pre[,i] ~ mcp_decon_pre$response)
+    comparison_pre$pvalue[i] <- test$p.value
+  }else{
+    if (var_pre[[i]] < 0.05){
+      test <- t.test(mcp_decon_pre[,i] ~ mcp_decon_pre$response,
+                     paired = FALSE, 
+                     mu = 0, conf.level = 0.95, var.equal = F)
+      comparison_pre$pvalue[i] <- test$p.value
+    }else{
+      test <- t.test(mcp_decon_pre[,i] ~ mcp_decon_pre$response,
+                     paired = FALSE, 
+                     mu = 0, conf.level = 0.95, var.equal = T)
+      comparison_pre$pvalue[i] <- test$p.value
+    }
+  }
+}
+
+for (i in 1:28){
+  if (shapiro_immune_pre[[i]] < 0.05){
+    test <- wilcox.test(mcp_decon_immune_pre[,i] ~ mcp_decon_immune_pre$response)
+    comparison_immune_pre$pvalue[i] <- test$p.value
+  }else{
+    if (var_immune_pre[[i]] < 0.05){
+      test <- t.test(mcp_decon_immune_pre[,i] ~ mcp_decon_immune_pre$response,
+                     paired = FALSE, 
+                     mu = 0, conf.level = 0.95, var.equal = F)
+      comparison_immune_pre$pvalue[i] <- test$p.value
+    }else{
+      test <- t.test(mcp_decon_immune_pre[,i] ~ mcp_decon_immune_pre$response,
+                     paired = FALSE, 
+                     mu = 0, conf.level = 0.95, var.equal = T)
+      comparison_immune_pre$pvalue[i] <- test$p.value
+    }
+  }
+}
+
+
+comparison_pre$padjusted <- p.adjust(comparison_pre$pvalue, method = "fdr")
+comparison_immune_pre$padjusted <- p.adjust(comparison_immune_pre$pvalue, method = "fdr")
+```
+
+None of the cell populations seem to be significantly different in pre-treatment samples.
+
+```{r}
+# Comparison of infiltrated populations post-non-responders vs. post-responders
+# Prepare data
+mcp_decon_post <- as.data.frame(t(mcp_decon_post[,-17])) %>% 
+  mutate(response = pheno_post$response)
+
+mcp_decon_immune_post <- as.data.frame(t(mcp_decon_immune_post[,-17])) %>% 
+  mutate(response = pheno_post$response)
+
+# Previous comprovations
+shapiro_post <- apply(mcp_decon_post[,-11], 2 , function(x) shapiro.test(x)$p.value) # normality
+var_post <- apply(mcp_decon_post[,-11], 2, function(x) var.test(x ~ mcp_decon_post$response)$p.value) # homocedasticity
+
+shapiro_immune_post <- apply(mcp_decon_immune_post[,-29], 2 , function(x) shapiro.test(x)$p.value) # normality
+var_immune_post <- apply(mcp_decon_immune_post[,-29], 2, function(x) var.test(x ~ mcp_decon_immune_post$response)$p.value) # homocedasticity
+
+# Tests 
+comparison_post <- data.frame(row.names = colnames(mcp_decon_post[,-11]),
+                         "pvalue" = rep(0, 10))
+
+comparison_immune_post <- data.frame(row.names = colnames(mcp_decon_immune_post[,-29]),
+                         "pvalue" = rep(0, 28))
+
+
+for (i in 1:10){
+  if (shapiro_post[[i]] < 0.05){
+    test <- wilcox.test(mcp_decon_post[,i] ~ mcp_decon_post$response)
+    comparison_post$pvalue[i] <- test$p.value
+  }else{
+    if (var_post[[i]] < 0.05){
+      test <- t.test(mcp_decon_post[,i] ~ mcp_decon_post$response,
+                     paired = FALSE, 
+                     mu = 0, conf.level = 0.95, var.equal = F)
+      comparison_post$pvalue[i] <- test$p.value
+    }else{
+      test <- t.test(mcp_decon_post[,i] ~ mcp_decon_post$response,
+                     paired = FALSE, 
+                     mu = 0, conf.level = 0.95, var.equal = T)
+      comparison_post$pvalue[i] <- test$p.value
+    }
+  }
+}
+
+for (i in 1:28){
+  if (shapiro_immune_post[[i]] < 0.05){
+    test <- wilcox.test(mcp_decon_immune_post[,i] ~ mcp_decon_immune_post$response)
+    comparison_immune_post$pvalue[i] <- test$p.value
+  }else{
+    if (var_immune_post[[i]] < 0.05){
+      test <- t.test(mcp_decon_immune_post[,i] ~ mcp_decon_immune_post$response,
+                     paired = FALSE, 
+                     mu = 0, conf.level = 0.95, var.equal = F)
+      comparison_immune_post$pvalue[i] <- test$p.value
+    }else{
+      test <- t.test(mcp_decon_immune_post[,i] ~ mcp_decon_immune_post$response,
+                     paired = FALSE, 
+                     mu = 0, conf.level = 0.95, var.equal = T)
+      comparison_immune_post$pvalue[i] <- test$p.value
+    }
+  }
+}
+
+
+comparison_post$padjusted <- p.adjust(comparison_post$pvalue, method = "fdr")
+comparison_immune_post$padjusted <- p.adjust(comparison_immune_post$pvalue, method = "fdr")
+```
+
+There are significant differences between several populations.
+
+```{r}
+# Comparison of infiltrated populations post-responders vs. pre-responders
+# Prepare data
+# We have to select patients that have both pre and post to compare paired data 
+pre_post_id <- intersect(rownames(mcp_decon_pre)[mcp_decon_pre$response == "responders"],
+                         rownames(mcp_decon_post)[mcp_decon_post$response == "responders"])
+                         
+mcp_decon_prepost <- rbind(mcp_decon_pre[which(rownames(mcp_decon_pre) %in% pre_post_id), ],
+                           mcp_decon_post[which(rownames(mcp_decon_post) %in% pre_post_id), ])
+mcp_decon_prepost$time <- c(rep("pre", 4), rep("post", 4))
+
+mcp_decon_immune_prepost <- rbind(mcp_decon_immune_pre[which(rownames(mcp_decon_immune_pre) %in% pre_post_id), ], mcp_decon_immune_post[which(rownames(mcp_decon_immune_post) %in% pre_post_id), ])
+mcp_decon_immune_prepost$time <- c(rep("pre", 4), rep("post", 4))
+
+# Previous comprovations
+shapiro_prepost <- apply(mcp_decon_prepost[, -c(11,12)], 2 , function(x) shapiro.test(x)$p.value) # normality
+var_prepost <- apply(mcp_decon_prepost[, -c(11,12)], 2, function(x) var.test(x ~ mcp_decon_prepost$time)$p.value) # homocedasticity
+
+shapiro_immune_prepost <- apply(mcp_decon_immune_prepost[,-c(29,30)], 2 , function(x) shapiro.test(x)$p.value) # normality
+var_immune_prepost <- apply(mcp_decon_immune_prepost[,-c(29,30)], 2, function(x) var.test(x ~ mcp_decon_immune_prepost$time)$p.value) # homocedasticity
+
+# Tests 
+comparison_prepost <- data.frame(row.names = colnames(mcp_decon_prepost[,-c(11,12)]),
+                         "pvalue" = rep(0, 10))
+
+comparison_immune_prepost <- data.frame(
+  row.names = colnames(mcp_decon_immune_prepost[,-c(29,30)]),
+  "pvalue" = rep(0, 28))
+
+
+for (i in 1:10){
+  if (shapiro_prepost[[i]] < 0.05){
+    test <- wilcox.test(mcp_decon_prepost[,i] ~ mcp_decon_prepost$time)
+    comparison_prepost$pvalue[i] <- test$p.value
+  }else{
+    if (var_prepost[[i]] < 0.05){
+      test <- t.test(mcp_decon_prepost[,i] ~ mcp_decon_prepost$time,
+                     paired = TRUE, 
+                     mu = 0, conf.level = 0.95, var.equal = F)
+      comparison_prepost$pvalue[i] <- test$p.value
+    }else{
+      test <- t.test(mcp_decon_prepost[,i] ~ mcp_decon_prepost$time,
+                     paired = TRUE, 
+                     mu = 0, conf.level = 0.95, var.equal = T)
+      comparison_prepost$pvalue[i] <- test$p.value
+    }
+  }
+}
+
+for (i in 1:28){
+  if (shapiro_immune_prepost[[i]] < 0.05){
+    test <- wilcox.test(mcp_decon_immune_prepost[,i] ~ mcp_decon_immune_prepost$time)
+    comparison_immune_prepost$pvalue[i] <- test$p.value
+  }else{
+    if (var_immune_prepost[[i]] < 0.05){
+      test <- t.test(mcp_decon_immune_prepost[,i] ~ mcp_decon_immune_prepost$time,
+                     paired = TRUE, 
+                     mu = 0, conf.level = 0.95, var.equal = F)
+      comparison_immune_prepost$pvalue[i] <- test$p.value
+    }else{
+      test <- t.test(mcp_decon_immune_prepost[,i] ~ mcp_decon_immune_prepost$time,
+                     paired = TRUE, 
+                     mu = 0, conf.level = 0.95, var.equal = T)
+      comparison_immune_prepost$pvalue[i] <- test$p.value
+    }
+  }
+}
+
+
+comparison_prepost$padjusted <- p.adjust(comparison_prepost$pvalue, method = "fdr")
+comparison_immune_prepost$padjusted <- p.adjust(comparison_immune_prepost$pvalue, method = "fdr")
+```
+
+There are no differences between pre-responders and post-responders populations, although some opopulations show a tendency. 
+
+```{r}
+# Comparison of infiltrated populations pre-PD vs. post-PD
+# Prepare data
+pre_post_id_PD <- intersect(rownames(mcp_decon_pre)[mcp_decon_pre$response == "non-responders"],
+                         rownames(mcp_decon_post)[mcp_decon_post$response == "non-responders"])
+                         
+mcp_decon_prepost_PD <- rbind(mcp_decon_pre[which(rownames(mcp_decon_pre) %in% pre_post_id_PD), ],
+                           mcp_decon_post[which(rownames(mcp_decon_post) %in% pre_post_id_PD), ])
+mcp_decon_prepost_PD$time <- c(rep("pre", 9), rep("post", 9))
+
+mcp_decon_immune_prepost_PD <- rbind(mcp_decon_immune_pre[which(rownames(mcp_decon_immune_pre) %in% pre_post_id_PD), ], mcp_decon_immune_post[which(rownames(mcp_decon_immune_post) %in% pre_post_id_PD), ])
+mcp_decon_immune_prepost_PD$time <- c(rep("pre", 9), rep("post", 9))
+
+# Previous comprovations
+shapiro_prepost_PD <- apply(mcp_decon_prepost_PD[, -c(11,12)], 2 , function(x) shapiro.test(x)$p.value) # normality
+var_prepost_PD <- apply(mcp_decon_prepost_PD[, -c(11,12)], 2, function(x) var.test(x ~ mcp_decon_prepost_PD$time)$p.value) # homocedasticity
+
+shapiro_immune_prepost_PD <- apply(mcp_decon_immune_prepost_PD[,-c(29,30)], 2 , function(x) shapiro.test(x)$p.value) # normality
+var_immune_prepost_PD <- apply(mcp_decon_immune_prepost_PD[,-c(29,30)], 2, function(x) var.test(x ~ mcp_decon_immune_prepost_PD$time)$p.value) # homocedasticity
+
+# Tests 
+comparison_prepost_PD <- data.frame(row.names = colnames(mcp_decon_prepost_PD[,-c(11,12)]),
+                         "pvalue" = rep(0, 10))
+
+comparison_immune_prepost_PD <- data.frame(
+  row.names = colnames(mcp_decon_immune_prepost_PD[,-c(29,30)]),
+  "pvalue" = rep(0, 28))
+
+
+for (i in 1:10){
+  if (shapiro_prepost_PD[[i]] < 0.05){
+    test <- wilcox.test(mcp_decon_prepost_PD[,i] ~ mcp_decon_prepost_PD$time)
+    comparison_prepost_PD$pvalue[i] <- test$p.value
+  }else{
+    if (var_prepost_PD[[i]] < 0.05){
+      test <- t.test(mcp_decon_prepost_PD[,i] ~ mcp_decon_prepost_PD$time,
+                     paired = TRUE, 
+                     mu = 0, conf.level = 0.95, var.equal = F)
+      comparison_prepost_PD$pvalue[i] <- test$p.value
+    }else{
+      test <- t.test(mcp_decon_prepost_PD[,i] ~ mcp_decon_prepost_PD$time,
+                     paired = TRUE, 
+                     mu = 0, conf.level = 0.95, var.equal = T)
+      comparison_prepost_PD$pvalue[i] <- test$p.value
+    }
+  }
+}
+
+for (i in 1:28){
+  if (shapiro_immune_prepost_PD[[i]] < 0.05){
+    test <- wilcox.test(mcp_decon_immune_prepost_PD[,i] ~ mcp_decon_immune_prepost_PD$time)
+    comparison_immune_prepost_PD$pvalue[i] <- test$p.value
+  }else{
+    if (var_immune_prepost_PD[[i]] < 0.05){
+      test <- t.test(mcp_decon_immune_prepost_PD[,i] ~ mcp_decon_immune_prepost_PD$time,
+                     paired = TRUE, 
+                     mu = 0, conf.level = 0.95, var.equal = F)
+      comparison_immune_prepost_PD$pvalue[i] <- test$p.value
+    }else{
+      test <- t.test(mcp_decon_immune_prepost_PD[,i] ~ mcp_decon_immune_prepost_PD$time,
+                     paired = TRUE, 
+                     mu = 0, conf.level = 0.95, var.equal = T)
+      comparison_immune_prepost_PD$pvalue[i] <- test$p.value
+    }
+  }
+}
+
+
+comparison_prepost_PD$padjusted <- p.adjust(comparison_prepost_PD$pvalue, method = "fdr")
+comparison_immune_prepost_PD$padjusted <- p.adjust(comparison_immune_prepost_PD$pvalue, method = "fdr")
+```
+
+There are no significant differences. 
+
+## Visualization
+
+```{r}
+comparison_pre <- comparison_pre %>% mutate("-log2pvalue" = -log2(comparison_pre$padjusted), 
+                                            cell_population = rownames(comparison_pre),
+                                            contrast = "pre-non-responders vs. pre-responders")
+
+comparison_post <- comparison_post %>% mutate("-log2pvalue" = -log2(comparison_post$padjusted), 
+                                            cell_population = rownames(comparison_post),
+                                            contrast = "post-non-responders vs. post-responders")
+
+comparison_prepost <- comparison_prepost %>% 
+  mutate("-log2pvalue" = -log2(comparison_prepost$padjusted),
+         cell_population = rownames(comparison_prepost),
+         contrast = "post-responders vs. pre-responders")
+
+comparison_prepost_PD <- comparison_prepost_PD %>% 
+  mutate("-log2pvalue" = -log2(comparison_prepost_PD$padjusted),
+         cell_population = rownames(comparison_prepost_PD),
+         contrast = "post-non-responders vs. pre-non-responders")
+
+comparisons <- rbind(comparison_pre, comparison_post, comparison_prepost, comparison_prepost_PD)
+
+
+comparison_immune_pre <- comparison_immune_pre %>% 
+  mutate("-log2pvalue" = -log2(comparison_immune_pre$padjusted), 
+         cell_population = rownames(comparison_immune_pre),
+         contrast = "pre-non-responders vs. pre-responders")
+
+comparison_immune_post <- comparison_immune_post %>% 
+  mutate("-log2pvalue" = -log2(comparison_immune_post$padjusted), 
+         cell_population = rownames(comparison_immune_post),
+         contrast = "post-non-responders vs. post-responders")
+
+comparison_immune_prepost <- comparison_immune_prepost %>% 
+  mutate("-log2pvalue" = -log2(comparison_immune_prepost$padjusted), 
+         cell_population = rownames(comparison_immune_prepost),
+         contrast = "post-responders vs. pre-responders")
+
+comparison_immune_prepost_PD <- comparison_immune_prepost_PD %>% 
+  mutate("-log2pvalue" = -log2(comparison_immune_prepost_PD$padjusted), 
+         cell_population = rownames(comparison_immune_prepost_PD),
+         contrast = "post-non-responders vs. pre-non-responders")
+
+comparisons_immune <- rbind(comparison_immune_pre, comparison_immune_post, 
+                            comparison_immune_prepost, comparison_immune_prepost_PD)
+
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/deconvolution/lolliplots_mcp_adjusted.pdf")
+
+ggplot(comparisons, aes(x = cell_population, y = `-log2pvalue`)) +
+  geom_segment(aes(x = cell_population, xend = cell_population, y=0, yend = `-log2pvalue`), 
+               color = "grey") + geom_point(size = 3, aes(colour = contrast)) + 
+  scale_fill_manual(values = c("cadetblue", "darkgoldenrod2", "tomato1", "tan1")) + 
+  theme_light() +
+  theme(panel.grid.major.x = element_blank(), 
+        panel.border = element_blank(), 
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_text(angle = 60, size = 10, hjust = 1)) +
+  geom_hline(yintercept = -log2(0.05), linetype = "dashed", color = "red") +
+  xlab("Immune cell populations") + ylab("-log2 adjusted p-value")
+
+ggplot(comparisons_immune, aes(x = cell_population, y = `-log2pvalue`)) +
+  geom_segment(aes(x = cell_population, xend = cell_population, y = 0, yend = `-log2pvalue`), 
+               color = "grey") + geom_point(size = 3, aes(colour = contrast)) + 
+  scale_fill_manual(values = c("cadetblue", "darkgoldenrod2", "tomato1", "tan1")) + 
+  theme_bw() + # ylim(0, 10) +
+  theme(panel.grid.major.x = element_blank(), 
+        panel.border = element_blank(), 
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_text(angle = 50, size = 10, hjust = 1)) +
+  geom_hline(yintercept = -log2(0.05), linetype = "dashed", color = "red") +
+  xlab("Immune cell populations") + ylab("-log2 adjusted p-value")
+
+dev.off()
+```
+
+The contrast with more significant differences is post-non-responders vs. post-responders, followed by post-responders vs. pre-responders, with some of the populations following the same. The signigicantly different populations in post-treatment samples are: Activated CD4 T cell, Activated CD8 T cell, Central Memory CD8 T cell, Effector Memory CD8 T cell, Macrophage, Immature B cell, Mast cell, Natural Killer cell, Regulatory T cell, T follicular helper cell, Type 1 T helper cell. 
+
+In other studies in patients with metastatic melanoma, immune infiltration has not been associtaed with clinical activity, but increases in immune cell infiltration have been observed after second doses with ipilimumab in responder patients. In other studies with pembrolizumab treatment, pre-treatment samples displayed higher CD8+ T-cell infiltration in responding patients (something it is not-seen in our cohort but changes during the treatment). Increase in CD8+ T cells has also been seen during anti-PD-1 treatment in responders. In general, CD8+, CD3+ and CD45RO+ have been associated with responders^6^.
+
+## Saving cell population estimates 
+
+```{r}
+write.table(mcp_decon_pre, file = "/omics/groups/OE0436/data/jimenez/outputs/rnaseq/deconvolution/mcp_decon_pre.tsv", sep = "\t", col.names = TRUE, row.names = TRUE)
+
+write.table(mcp_decon_immune_pre, file = "/omics/groups/OE0436/data/jimenez/outputs/rnaseq/deconvolution/mcp_decon_immune_pre.tsv", sep = "\t", col.names = TRUE, row.names = TRUE)
+
+write.table(mcp_decon_post, file = "/omics/groups/OE0436/data/jimenez/outputs/rnaseq/deconvolution/mcp_decon_post.tsv", sep = "\t", col.names = TRUE, row.names = TRUE)
+
+write.table(mcp_decon_immune_post, file = "/omics/groups/OE0436/data/jimenez/outputs/rnaseq/deconvolution/mcp_decon_immune_post.tsv", sep = "\t", col.names = TRUE, row.names = TRUE)
+```
+
+
+## Bibliography
+1. Fridman, W. H., Pagès, F., Saut̀s-Fridman, C. & Galon, J. The immune contexture in human tu-mours: impact on clinical outcome. Nature Re-views Cancer 2012 12:4 12, 298–306 (2012).
+2. Avila Cobos, F., Vandesompele, J., Mestdagh, P. & de Preter, K. Computational deconvolution of transcriptomics data from mixed cell popula-tions. Bioinformatics 34, 1969–1979 (2018).
+3. Becht, E. et al. Estimating the population abun-dance of tissue-infiltrating immune and stromal cell populations using gene expression. Ge-nome Biology 17, 1–20 (2016).
+4. Charoentong, P. et al. Pan-cancer Immunoge-nomic Analyses Reveal Genotype-Immunophenotype Relationships and Predic-tors of Response to Checkpoint Blockade. Cell Reports 18, 248–262 (2017).
+5. Avila Cobos, F., Alquicira-Hernandez, J., Pow-ell, J. E., Mestdagh, P. & de Preter, K. Bench-marking of cell type deconvolution pipelines for transcriptomics data. Nature Communications 2020 11:1 11, 1–14 (2020).
+6. Gibney, G. T., Weiner, L. M., Michael, P. & At-kins, B. Predictive biomarkers for checkpoint inhibitor-based immunotherapy. doi:10.1016/S1470-2045(16)30406-5 (2016). 

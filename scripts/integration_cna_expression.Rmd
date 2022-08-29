@@ -1,0 +1,398 @@
+---
+title: <span style="font-family:Georgia;">Integration of CNA and expression data with DIABLO</span>
+author: "Víctor Jiménez Martínez"
+date: "2022"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Introduction
+
+Data Integration Analysis for Biomarker discovery using Latent component method for Omics studies (DIABLO)^1^ is the multi-block discriminant analysis from the mixOmics^2^ R package. DIABLO allows the integration of several omics data sets on a set of samples to identify a multi-omics signature that explains a given outcome. DIABLO applies a sparse General-ized Canonical Correlation Analysis (sGCCA)^3^, a multivariate dimension reduction methodology that uses singular value decomposition to select correlated variables from several omics data sets by maximizing the covariance between linear combinations of variables and projecting the data into smaller dimensional subspace spanned by the components. This way, highly correlated variables between and within omics datasets are identified and integrated in the model to explain response to treatment in pre-treatment samples.
+
+In this case, the layers integrated were expression data and CNA data expected to identify a correlated signature discriminating by response. Before applying the method data must be filtered and prepared. TPM normalized counts were used for expression data. Regarding the filtering, it is mainly recommended for computing and R memory purposes and for facilitating data mining (assuming that out of thousands of variables, most of them will not be useful to explain a biological outcome). The filtering is recommended to be based on the variance across all the samples (the ones holding larger variances are more likely to explain differences). Usually, no more than 5.000-10.000 features are recommended. 
+
+Another factor to consider is the number of samples available. A total of 21 pre-treatment samples with WES and RNAseq data were available: 14 non-responders and 7 responders. With the purpose of building a model that allowed to discriminate, 5 samples of each group were randomly selected to build the model, while the rest were kept to further test the model with “external” data.
+
+## Libraries
+
+Libraries needed for the analyses are loaded below.
+
+```{r, results="hide", message=FALSE, warning=FALSE}
+# R version used in this script is 4.2.0
+# library(devtools)
+# install_github("mixOmicsTeam/mixOmics") # I had to install the latest version
+library(ggplot2) # plots
+library(EDASeq) # for RLE plots
+library(mixOmics) # for integrating omics data through multivariate methods
+library(tidyr) # to manage data
+library(dplyr) # to manage data
+library(biomaRt)
+library(ggpubr)
+library(edgeR)
+```
+
+# Loading and preparing data
+
+```{r}
+# TPM Expression data
+tpm <- read.delim("/omics/groups/OE0436/data/jimenez/data/rnaseq/rnaseq_tpm_met1_protein_coding.tsv")
+colnames(tpm)[1:5] <- sapply(colnames(tpm)[1:5], function(x) gsub("^X", "", x)) # adapt five first PIDs
+
+# CNA data
+cna <- read.delim("/omics/groups/OE0436/data/jimenez/data/cna_met1.tsv")
+colnames(cna)[1:5] <- sapply(colnames(cna)[1:5], function(x) gsub("^X", "", x)) # adapt five first PIDs
+```
+
+All our available data in pre-treatment samples has information for the same patients: 21 out of the 24 in the cohort. We have to order them in the same order and read pheno data accordingly. 
+
+```{r}
+# Check order
+identical(colnames(tpm), colnames(cna))
+
+# Pheno data with information on treatment and response
+pheno <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/PID_treatment.csv", 
+                  header = TRUE, sep = ";", row.names = "PID")
+
+colnames(pheno) = c("therapy", "evolution") # change names
+
+pheno <- pheno %>% 
+  mutate(response = ifelse(evolution == "PR", "responders", "non-responders"))
+
+pheno <- pheno[colnames(tpm), ]
+```
+
+## Normalization
+
+As seen in previous analyses (rnaseq_DEA), TPM normalization is enough to obtain normalized expression data. Here, thus, CNA normalization is checked.  
+
+```{r}
+################### CNA data
+MbyTPM <- log2(cna[, 1] - cna[, 4])
+hist(as.numeric(MbyTPM), xlab = "log2-ratio", main = "TCN")
+abline(v = 0, col = "red")
+
+# It is not normal, let's try with z-scores...
+zcna <- (cna - apply(cna, 2, mean)) / apply(cna, 2, sd)
+
+# histogram
+MbyTPM <- log2(zcna[, 1] - zcna[, 4])
+hist(as.numeric(MbyTPM), xlab = "log2-ratio", main = "Differences in log2 ration in z-score TCN between two samples")
+abline(v = 0, col = "red")
+
+# MAplot
+maPlot(as.numeric(zcna[, 3]), as.numeric(zcna[, 4]),
+       pch = 19, cex = 0.5, ylim = c(-8, 8),
+       allCol = "darkgray", lowess = TRUE,
+       xlab = expression(A == log[2](sqrt(Sample1 %.% Sample2))),
+       ylab = expression(M == log[2](Sample1/Sample2)))
+grid(col = "black")
+title("TNC z-score normalization")
+
+#RLE
+plotRLE(as.matrix(zcna), outline = FALSE, ylim = c(-2, 2), main = "RLE for z-score TCN")
+plotRLE(as.matrix(cna), outline = FALSE, ylim = c(-2, 2), main = "RLE for raw TCN")
+```
+
+Although z-scores are not a perfect normalization of CNA data, it accomplishes quite a normal distribution and dispersion in most of samples is little. 
+
+## PCA
+
+Let's again compute the PCA to see the clustering of our data according to the groups across the different layers of information. 
+
+```{r}
+############# RNAseq data
+# Compute PCA
+pca_data <- prcomp(t(tpm), retx=TRUE, center=TRUE, scale=FALSE)
+summary(pca_data)$importance[,c(1,2)]
+
+# Scores data
+scores <- as.data.frame(pca_data$x[, c("PC1", "PC2")]) # loading coeficients
+scores$Response <- pheno$response # response to treatment 
+scores$batch <- pheno$batch
+
+# Plot
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/DEA/protein_coding_genes/PCA_expression_tpm_protein_coding.pdf")
+
+scores.plot <- ggplot(data = scores, 
+                      aes(x = PC1, 
+                          y = PC2, 
+                          colour = Response, 
+                          label = rownames(scores))) + 
+  geom_point(alpha = I(0.7), size = 4) + 
+  geom_hline(yintercept = 0)+
+  geom_vline(xintercept = 0)+
+  xlab(paste0("PC1 (", round(summary(pca_data)$importance[2,1], 2) * 100, "%)"))+
+  ylab(paste0("PC2 (", round(summary(pca_data)$importance[2,2], 2) * 100, "%)"))+
+  stat_ellipse() + scale_color_manual(values = c("red", "green")) +
+  theme_bw() + ggtitle("PCA with expression data (TPM counts)")
+
+scores.plot
+
+dev.off()
+
+############# CNA data
+# Compute PCA
+pca_data <- prcomp(t(zcna), retx=TRUE, center=TRUE, scale=FALSE)
+summary(pca_data)$importance[,c(1,2)]
+
+# Scores data
+scores <- as.data.frame(pca_data$x[, c("PC1", "PC2")]) # loading coeficients
+scores$Response <- pheno$response # response to treatment 
+scores$batch <- pheno$batch
+
+# Plot
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/DEA/protein_coding_genes/PCA_expression_tpm_protein_coding.pdf")
+
+scores.plot <- ggplot(data = scores, 
+                      aes(x = PC1, 
+                          y = PC2, 
+                          colour = Response, 
+                          label = rownames(scores))) + 
+  geom_point(alpha = I(0.7), size = 4) + 
+  geom_hline(yintercept = 0)+
+  geom_vline(xintercept = 0)+
+  xlab(paste0("PC1 (", round(summary(pca_data)$importance[2,1], 2) * 100, "%)"))+
+  ylab(paste0("PC2 (", round(summary(pca_data)$importance[2,2], 2) * 100, "%)"))+
+  stat_ellipse() + scale_color_manual(values = c("red", "green")) +
+  theme_bw() + ggtitle("PCA with pre-treatment TCN z-score values")
+
+scores.plot
+
+dev.off()
+```
+
+## Omics data integration through N-block approaches: mixOmics DIABLO
+
+As said DIABLO allows the integration of several omics data sets on a set of samples to identify a multi-omics signature that explains a given outcome.
+
+### Filtering
+
+The filtering is recommended to be based on the variance across all the samples: those variables that hold a larger variance are more likely to explain the differences. Usually, no more than the top most variable 5,000-10,000 features are kept. In this analysis, this criteria will be applied to TCN, the most variable 500 genes will be selected. As for the expression data, while the expression for the differentially expressed genes (as obtained in rnaseq_DEA.Rmd) will be used. 
+
+```{r}
+# DEG are loaded 
+deg <- read.delim("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/DEA/protein_coding_genes/DEG_protein_coding_pre.tsv")
+
+tpm_deg <- tpm[rownames(deg), ] # subset for our genes
+
+# Selection of top 500 most variable genes in CNA data
+# Compute the variance of each gene across samples
+V <- apply(zcna, 1, var)
+
+# Results are sorted by variance in decreasing order and top 100 genes are selected
+cna_sel <- zcna[names(V[order(V, decreasing = T)][1:500]), ]
+
+################
+# We select 5 random samples of both groups to build the model
+set.seed(123)
+cases_model_idx <- c(sample(which(pheno$response == "responders"), 5),
+                     sample(which(pheno$response == "non-responders"), 5))
+
+# And subset our data
+tpm_deg_model <- tpm_deg[, cases_model_idx]
+zcna_model <- cna_sel[, cases_model_idx]
+
+# Transpose data: samples in rows and variables (genes and probes) in columns
+tpm_deg_model_t <- t(tpm_deg_model)
+zcna_model_t <- t(zcna_model)
+
+# Condition: aged vs young
+pheno_model <- pheno[cases_model_idx, ]
+cond <- pheno$response[cases_model_idx]
+```
+
+### Building the model
+
+Once data is prepared, method may be applied. First of all, a list with all data and a design matrix containing the expected correlation for our omics data are built. For a first iteration without previous knowledge on potential correlations, 0.1 is employed.
+
+```{r}
+# Let's explore correlation 
+# Build data frame with median for each layer
+correlation <- data.frame(row.names = rownames(tpm_deg_model_t),
+                          "mRNA" = as.numeric(apply(tpm_deg_model_t, 1, median)),
+                          "CNA" = as.numeric(apply(zcna_model_t, 1, median)))
+# Do different scatterplots
+# mRNA vs CNA: 0.37 pearson correlation
+ggplot(correlation, aes(x = mRNA, y = CNA)) + 
+  geom_point(size = 2) + # scale_color_manual(values = c("red", "green")) +
+  geom_text(aes(label = rownames(correlation)), size = 3, nudge_x = 0.25, nudge_y = 0.25, 
+            check_overlap = T, color = "black") +
+  ylab("z-score TCN median") +
+  xlab("RNAseq median expression for DEG") + theme_bw() +
+  # facet_wrap(~ Time, scales = "free_x") +
+  theme(strip.background = element_rect(fill = "white", color = "black"),
+        strip.text.x = element_text(size = 12)) +
+  stat_cor(method = "pearson")
+
+# List with expression and methylation data sets
+data <- list(mRNA = tpm_deg_model_t, CNA = zcna_model_t)
+
+# Design matrix
+design <- matrix(0.1, ncol = length(data), nrow = length(data), 
+                dimnames = list(names(data), names(data)))
+diag(design) <- 0 # matrix diagonal is set to 0 (we do not want correlation between equal omics data)
+```
+
+Method may be now applied accounting for the response groups and our design. An initial number of components for the model is selected: in our case, 5 components are initially included. From this result, an evaluation of classification and prediction performance using k-fold cross-validation is performed to estimate the optimal number of components for the model.
+
+```{r}
+# Apply method
+res <- block.splsda(X = data, Y = cond, ncomp = 5, design = design)
+
+# Performance evaluation
+set.seed(123) # for reproducibility, only when the `cpus' argument is not used
+# 5-fold cross validation repeated 10 times
+perf.diablo <- perf(res, validation = 'Mfold', folds = 5, nrepeat = 10)
+
+plot(perf.diablo)
+```
+
+The previous performance plot outputs the classification error rate according to three prediction distances. The minimum point is found at four components by mahalanobis distance. 
+
+Next step is selecting the optimal number of variables in the model for each omics data set. For that, we employ tunning indicating a grid of keepX values that are assessed on each component, one at a time. That is, we use a vector to select different numbers of variables to test. A BPARAM parameter is defined to set the parallelization of the process. For each data set, 5 to 10 features will be tested per component.
+
+```{r}
+# Optimal number of components
+ncomp = 2
+
+# Tunning
+set.seed(123) # for reproducibility, only when the `cpus' argument is not used
+test.keepX = list (mRNA = c(5:10),
+                   CNA = c(5:10)) 
+
+BPPARAM <- BiocParallel::MulticoreParam(workers = parallel::detectCores()-1)
+
+tune.stad <- tune.block.splsda(X = data, Y = cond, ncomp = ncomp,
+                              test.keepX = test.keepX, design = design,
+                              validation = 'Mfold', folds = 5, nrepeat = 1,
+                              dist = "centroids.dist", BPPARAM = BPPARAM)
+
+# Features selected are listed 
+list.keepX <- tune.stad$choice.keepX
+list.keepX
+```
+
+A number of variables was selected for each of the four components in each layer of information (6, 6 for mRNA and 7, 7 for CNA).
+
+Now, the final model with the obtained list of features and the number of components may be computed.
+
+```{r}
+# Apply method with tunned params
+res.tune <- block.splsda(X = data, Y = cond, ncomp = ncomp, 
+                          keepX = list.keepX, design = design)
+
+res.tune$design # including our age condition
+```
+
+### Plots and results
+
+```{r}
+# Individual plots
+plotIndiv(res.tune, ind.names = FALSE, 
+          legend=TRUE, cex=c(1,2), ellipse = TRUE,
+          title = 'Response in individual layers')
+```
+
+mRNA acocmplishes a more distinguished differential distribution between groups. 
+
+Next, correlation of omics data can be plotted too.
+
+```{r}
+plotDiablo(res.tune, ncomp = 1)
+plotDiablo(res.tune, ncomp = 2)
+# plotDiablo(res.tune, ncomp = 3)
+# plotDiablo(res.tune, ncomp = 4)
+```
+
+Correlation is quite high between different omics information.
+
+```{r}
+# Arrow sample plot
+plotArrow(res.tune, ind.names = FALSE, legend = TRUE, main = 'DIABLO', 
+          col.per.group = c("red", "green"), legend.title = "Response")
+
+# Loadings
+plotLoadings(res.tune, comp = 1, contrib = 'max', 
+             method = 'median', legend.color = c("red", "green"))
+plotLoadings(res.tune, comp = 2, contrib = 'max', 
+             method = 'median', legend.color = c("red", "green"))
+# plotLoadings(res.tune, comp = 3, contrib = 'max', 
+#              method = 'median', legend.color = c("red", "green"))
+# plotLoadings(res.tune, comp = 4, contrib = 'max', 
+#              method = 'median', legend.color = c("red", "green"))
+
+# Correlation circle plot
+plotVar(res.tune, var.names = TRUE, style = 'graphics', legend = TRUE, 
+        pch = c(16, 17), cex = c(1,1))
+
+# Circos plot
+circosPlot(res.tune, cutoff = 0.8, size.variables = 0.5, line=TRUE,
+           col.per.group = c("red", "green"), Y.name = "Levels")
+
+pdf("/omics/groups/OE0436/data/jimenez/outputs/cimplot_diablo.pdf")
+
+cimDiablo(res.tune, legend.position = "topright", size.legend = 0.6, 
+          transpose = TRUE, trim = TRUE, #margins = c(10,15), 
+          dist.method = c("correlation", "correlation"), clust.method = c("complete","complete"))
+
+dev.off()
+
+pdf("/omics/groups/OE0436/data/jimenez/outputs/network_diablo.pdf")
+
+network(res.tune, blocks = c(1,2),
+        color.node = c('blue', 'green'), 
+        cutoff = 0.8)
+
+dev.off()
+```
+
+Considering all three layers of information across Dimension 1 and 2, our samples are discriminated by response, as shown above. Thus, we can conclude that integration of data may explain response differences.
+
+### Performance of the model
+
+Finally, we can test the performance of the final model as a classifier plotting a ROC curve. This AUC plot is computed from training cross-validation sets and averaged. Thus, it may give a quick insight into the capability of the model to predict original data. An AUC plot is obtained for each block of omics data using the first two components.
+
+```{r}
+# mRNA
+auc.mrna <- auroc(res.tune, roc.block = "mRNA", roc.comp = 2)
+
+# CNA
+auc.cna <- auroc(res.tune, roc.block = "CNA", roc.comp = 2)
+
+```
+
+Nonetheless, it is important to consider that this prediction is based on our same data. Thus, employing those samples that were not used to build the model, the model can be tested to compute the generalization error.
+
+```{r}
+# Prepare test data
+# Subset data with not used PIDs and transpose
+tpm_deg_test_t <- t(tpm_deg[, -cases_model_idx])
+zcna_test_t <- t(cna_sel[, -cases_model_idx])
+
+data.test <- list(mRNA = tpm_deg_test_t, CNA = zcna_test_t)
+
+# Prediction 
+predict.diablo <- predict(res.tune, newdata = data.test)
+
+# Confussion matrix compares the real and predicted subtypes.
+confusion.mat <- get.confusion_matrix(truth = pheno$response[-cases_model_idx], 
+                     predicted = predict.diablo$WeightedVote$centroids.dist[,2])
+confusion.mat
+
+# ROC curves
+auroc(res.tune, roc.block = "mRNA", newdata = data.test)
+
+auroc(res.tune, roc.block = "CNA", newdata = data.test)
+
+# Error rate: incorrect predictions in the total
+error_rate <- (confusion.mat[1,2] + confusion.mat[2,1]) / 10
+error_rate
+```
+
+## References
+1.Singh, A. et al. DIABLO: an integrative ap-proach for identifying key molecular drivers from multi-omics assays. doi:10.1093/bioinformatics/bty1054.
+2.Rohart, F., Gautier, B., Singh, A. & Lê Cao, K. A. mixOmics: An R package for ‘omics feature selection and multiple data integration. PLoS Comput Biol 13, e1005752 (2017).
+3.Tenenhaus, A. et al. Variable selection for gen-eralized canonical correlation analysis. Biosta-tistics 15, 569–583 (2014).

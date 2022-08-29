@@ -1,0 +1,270 @@
+---
+title: <span style="font-family:Georgia;">ssGSEA of immune cell populations</span>
+author: "Víctor Jiménez Martínez"
+date: "2022"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Introduction
+
+The main goal of this script is to perform a single sample GSEA (ssGSEA)^1^ to estimate the enrichment of a set of immune cell populations, following the methodologies of *Pan-cancer Immunogenomic Analyses Reveal Genotype-Immunophenotype Relationships and Predictors of Response to Checkpoint Blockadethis*^2^.
+
+The ssGSEA was not finally included in the paper. 
+
+## Libraries
+
+Libraries needed for the script are loaded below.
+
+```{r, results="hide", message=FALSE, warning=FALSE}
+# R version employed for this script is 4.2.0
+library(matrixStats)
+library(circlize)
+library(ComplexHeatmap)
+library(data.table)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(EnhancedVolcano)
+```
+
+## Loading data
+First of all, data must be loaded. 
+
+```{r}
+counts <- read.delim("/omics/groups/OE0436/data/jimenez/data/rnaseq/rnaseq_tpm_met1_protein_coding.tsv")
+colnames(counts)[1:5] <- sapply(colnames(counts)[1:5], function(x) gsub("^X", "", x))
+
+immune_genes <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/pan_cancer_immune_metagenes.csv", 
+                         header = TRUE, sep = ";")
+
+pheno <- read.csv(file = "/omics/groups/OE0436/data/jimenez/data/PID_treatment.csv", 
+                  header = TRUE, sep = ";", row.names = "PID")
+colnames(pheno) = c("therapy", "evolution") # change names
+
+pheno <- pheno %>% 
+  mutate(response = ifelse(evolution == "PR", "responders", "non-responders"))
+
+# Filter counts table to remove some background "noise"
+# Row sums must be higher than 10 in order to ensure there are enough counts
+counts <- counts[rowSums(counts) >10, ]
+
+cat(dim(counts)[1], 
+    "genes with more than 10 counts")
+
+# Keep genes that have counts in at least 60% of each group
+# Compute number of samples per experimental group and minimum percent
+n.samplespergroup <- table(pheno$Response) 
+percent <- 0.8 # define the 80%
+samples.min <- round(n.samplespergroup*(1-percent), 0) # number of samples that represents the 20%, the maximum amount of 0 allowed
+
+# Data frame with the number of 0 in each gene and sample
+df_0 <- data.frame(row.names = rownames(counts), 
+                   "PD" = rep(0, length(rownames(counts))), 
+                   "PR" = rep(0, length(rownames(counts))))
+for (i in 1:2){
+  c <- counts[ , which(colnames(counts) %in% rownames(pheno[pheno$Response == unique(pheno$Response)[i], ]))] # subset counts per group
+  how_many_0 <- apply(c, 1, function(x) sum(x == 0)) # compute how many 0 per gene
+  df_0[, i] <- as.vector(how_many_0)
+}
+
+# Get genes that have counts in at least 80% of the samples of at least one group
+resta <- apply(df_0, 1,  function(x) {any(x < as.vector(samples.min))}) # substract the 80% computed for each group to the counts found for each gene, if it is > 0 it means that at least 60% of samples counted that gene
+idx_80 <- rownames(counts)[which(resta == TRUE)]
+
+cat(length(idx_80), "out of", dim(counts)[1], 
+    "genes counted in 80% of the samples of at least one group")
+
+counts <- counts[idx_80, ]
+```
+
+## ssGSEA
+A function computing 
+
+```{r}
+# Computes the enrichment score for our gene sets in every single sample
+ssgsea <- function(X, gene_sets, alpha = 0.25, scale = T, norm = F, single = T) {
+  row_names <- rownames(X)
+  num_genes <- nrow(X)
+  gene_sets <- lapply(gene_sets, function(genes) {which(row_names %in% genes)})
+  
+  # Ranks for genes
+  R <- matrixStats::colRanks(X, preserveShape = T, ties.method = 'average')
+  
+  # Calculate enrichment score (es) for each sample (column)
+  es <- apply(R, 2, function(R_col) {
+    gene_ranks <- order(R_col, decreasing = TRUE)
+    
+    # Calculate es for each gene set
+    es_sample <- sapply(gene_sets, function(gene_set_idx) {
+      # pos: match (within the gene set)
+      # neg: non-match (outside the gene set)
+      indicator_pos <- gene_ranks %in% gene_set_idx
+      indicator_neg <- !indicator_pos
+      
+      rank_alpha  <- (R_col[gene_ranks] * indicator_pos) ^ alpha
+      
+      step_cdf_pos <- cumsum(rank_alpha)    / sum(rank_alpha)
+      step_cdf_neg <- cumsum(indicator_neg) / sum(indicator_neg)
+      
+      step_cdf_diff <- step_cdf_pos - step_cdf_neg
+      
+      # Normalize by gene number
+      if (scale) step_cdf_diff = step_cdf_diff / num_genes
+      
+      # Use ssGSEA or not
+      if (single) {
+        sum(step_cdf_diff)
+      } else {
+        step_cdf_diff[which.max(abs(step_cdf_diff))]
+      }
+    })
+    unlist(es_sample)
+  })
+  
+  if (length(gene_sets) == 1) es = matrix(es, nrow = 1)
+  
+  # Normalize by absolute diff between max and min
+  if (norm) es = es / diff(range(es))
+  
+  # Prepare output
+  rownames(es) <- names(gene_sets)
+  colnames(es) <- colnames(X)
+  return(es)
+}
+```
+
+## Preparation of data and ssGSEA
+As done in the article, normalization of raw counts is performed through z-score 
+
+```{r}
+zcounts <- (counts - apply(counts, 1, mean)) / apply(counts, 1, sd)
+zcounts[is.na(zcounts)] <- 0
+
+# List with every gene set per immune cell type
+gene_set <- list()
+for (type in unique(immune_genes$Cell.type)){
+  genes <- immune_genes$Metagene[immune_genes$Cell.type == type]
+  gene_set[[type]] <- genes
+}
+
+# attributes(gene_set) = list(names = names(gene_set),
+#                      row.names=1:max(table(immune_genes$Cell.type)), class='data.frame')
+
+## sGSEA
+result <- t(ssgsea(as.matrix(zcounts), gene_set, scale = TRUE, norm = FALSE))
+  
+# zscore of the ssgsea output 
+zresult <- (result - rowMeans(result))/(rowSds(as.matrix(result)))[row(result)]
+# rownames(zresult)[1:3] <- sapply(rownames(zresult)[1:3], function(x) gsub("^X", "", x))
+```
+
+## Description and plots
+
+```{r}
+## PCA
+# Compute PCA
+pca_data <- prcomp(zresult, retx=TRUE, center=TRUE, scale=FALSE)
+summary(pca_data)$importance[,c(1,2)]
+
+# Scores data
+scores <- as.data.frame(pca_data$x[, c("PC1", "PC2")]) # loading coeficients
+
+scores$class <- pheno$response # response to treatment 
+
+# Plot
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/ssGSEA/pca_ssGSEA.pdf")
+
+scores.plot <- ggplot(data = scores, 
+                      aes(x = PC1, 
+                          y = PC2, colour = class, 
+                          label = rownames(scores))) + 
+  geom_point(alpha = I(0.7), size = 4) + 
+  geom_hline(yintercept = 0)+
+  geom_vline(xintercept = 0)+
+  xlab(paste("PC1 (", round(summary(pca_data)$importance[2,1], 2) * 100, "%)"))+
+  ylab(paste("PC2 (", round(summary(pca_data)$importance[2,2], 2) * 100, "%)"))+
+  stat_ellipse() + 
+  theme_bw()
+
+scores.plot
+
+dev.off()
+
+## Heatmap 
+# colnames(zcounts)[1:3] <- sapply(colnames(zcounts)[1:3], function(x) gsub("^X", "", x))
+zcounts_immuno <- zcounts[which(rownames(zcounts) %in% immune_genes$Metagene), ]
+response <- data.frame(row.names = rownames(scores), "response" = scores$class)
+immune_cell <- data.frame(row.names = immune_genes$Metagene, "cell" = immune_genes$Cell.type)
+cols <- colorRampPalette(brewer.pal(9, "Set1"))
+ann_colors <- list(response = c(PD = "#5977ff", PR = "#f74747", "SD" = "#cc4ee0"))
+
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/ssGSEA/heatmap_panimmuno_genes_ssGSEA.pdf")
+
+pheatmap(as.matrix(zcounts_immuno[rownames(immune_cell), ]),
+         annotation_col = response, annotation_row = immune_cell,
+         cluster_rows = FALSE,
+         show_rownames = FALSE, show_colnames = TRUE,
+         annotation_legend = TRUE, annotation_names_col = FALSE, annotation_colors = ann_colors)
+
+dev.off() 
+
+## ES heatmap with immune cell populations
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/ssGSEA/heatmap_ES_cells_ssGSEA.pdf")
+
+pheatmap(as.matrix(t(zresult[,-29])),
+         annotation_col = response,
+         cluster_rows = FALSE,
+         show_rownames = TRUE, show_colnames = TRUE,
+         annotation_legend = TRUE, annotation_names_col = FALSE, annotation_colors = ann_colors)
+
+dev.off() 
+```
+
+## Statistical comparison
+
+```{r}
+# Comparison of infiltrated populations responders vs. non-responders
+# Prepare data
+zresult <- as.data.frame(zresult)
+zresult$response <- scores$class
+
+# Previous comprovations
+shapiro <- apply(zresult[,-29], 2 , function(x) shapiro.test(x)) # normality
+var <- apply(zresult[,-29], 2, function(x) var.test(x ~ zresult$response)$p.value) # homocedasticity
+
+# T-test
+ttest <- apply(zresult[, -29], 2, function(x) t.test(x ~ zresult$response,
+                                                    alternative = "two.sided", paired = FALSE, 
+                                                    mu = 0, conf.level = 0.95, var.equal = T))
+
+
+# Build data frame to compare in volcano plot
+comparison <- data.frame(row.names = colnames(zresult[,-29]), 
+                         "FC" = unlist(lapply(ttest, function(x) x$estimate[[1]]/x$estimate[[2]])),
+                         "log2FC" = log2(abs(unlist(lapply(ttest, function(x) x$estimate[[1]]/x$estimate[[2]])))),
+                         "pvalue" = unlist(lapply(ttest, function(x) x$p.value)), 
+                         "padjusted" = p.adjust(unlist(lapply(ttest, function(x) x$p.value)), method = "fdr"))
+
+# Volcano plot
+pdf("/omics/groups/OE0436/data/jimenez/outputs/rnaseq/ssGSEA/Volcanoplot_ssGSEA.pdf")
+
+EnhancedVolcano(comparison, lab = rownames(comparison), x = "log2FC", y = "pvalue",
+                pCutoff = 0.05, FCcutoff = 1, 
+                selectLab =  rownames(comparison),
+                title = "Volcano plot", subtitle = "PD vs PR ssGSEA TIL comparison",
+                legendLabSize = 10, legendIconSize = 3, legendPosition = "bottom", labSize = 3)
+
+dev.off()
+
+# # Save ES table
+# write.table(zresult, file = "/omics/groups/OE0436/data/jimenez/data/ssGSEA.tsv", sep = "\t", col.names = TRUE, row.names = TRUE)
+# write.table(zresult, file = "/omics/groups/OE0436/data/jimenez/outputs/rnaseq/ssGSEA/ssGSEA.tsv", sep = "\t", col.names = TRUE, row.names = TRUE)
+```
+
+## References
+1. Barbie, D. A. et al. Systematic RNA interfer-ence reveals that oncogenic KRAS-driven can-cers require TBK1. Nature 2009 462:7269 462, 108–112 (2009).
+2. Charoentong, P. et al. Pan-cancer Immunoge-nomic Analyses Reveal Genotype-Immunophenotype Relationships and Predic-tors of Response to Checkpoint Blockade. Cell Reports 18, 248–262 (2017).
+

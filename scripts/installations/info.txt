@@ -1,0 +1,1 @@
+This folder contains .txt files with the procedures followed for the installation of the several tools required during the project

@@ -1,0 +1,118 @@
+---
+title: <span style="font-family:Georgia;">Preparation of counts tables with RNA-seq data</span>
+author: "Víctor Jiménez Martínez"
+date: "2022"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Introduction
+
+The main goal of this script is to merge and obtain .tsv files with counts per patients. 
+
+## Libraries
+
+Libraries needed for the script are loaded below.
+
+```{r, results="hide", message=FALSE, warning=FALSE}
+library(tidyr) # to manage data
+library(dplyr) # to manage data
+library(biomaRt) # to call protein-coding genes
+```
+
+
+## Loading featureCounts files 
+
+```{r}
+# Directories
+rnaseq_directory <- "/omics/groups/OE0436/internal/eugenie/data/k28a/rna_sequencing/rnaseq_counts/"
+
+# Example
+ex <- read.delim(paste0(rnaseq_directory, "metastasis1_K28A-1CNM9W.fpkm_tpm.featureCounts.tsv"))
+
+colnames(ex)
+```
+
+## Reading all files to obtain a single counts table
+
+Each file contains several columns of information for the genes, from position to gene ID, raw and normalized counts. From these, a single matrix with the gene name and counts per sample will be obtained. Two tables, one with raw counts and the other with normalized counts can be obtained selecting the correspondant column. RPKM and TPM normalization methods are both proportional and take into account sequencing depth and transcript lengths, but TPM are unit-less and accomplish the invariant average criterion. In this matter, TPM is a modification of RPKM and a better approximation to relative RNA concentration. This, together with the fact that the samples in our cohort followed the same protocols in isolation and sequencing, make TPM a good option for normalized counts when needed in different analyses [1]. 
+
+```{r}
+# List all files of interest
+tsv_rnaseq <- list.files(path = rnaseq_directory, pattern = "metastasis4") # pre-treatment samples
+# tsv_rnaseq <- list.files(path = rnaseq_directory, pattern = "metastasis2") # post-treatment
+# tsv_rnaseq <- list.files(path = rnaseq_directory, pattern = "metastasis3")
+# tsv_rnaseq <- list.files(path = rnaseq_directory, pattern = "metastasis4")
+
+# Read tsv files adding a column for the file name
+read_delim_addfilename <- function(file){
+  read.delim(file) %>%
+    mutate(fileName = file)
+}
+
+# Create the counts table df: select if you want TPM, raw counts...
+counts <- lapply(paste0(rnaseq_directory, tsv_rnaseq), read_delim_addfilename) %>%
+  bind_rows() %>% # stack them all on top of each other
+  dplyr::select(name, fileName, TPM) %>% # select the correct columns: num_reads (raw), TPM
+  pivot_wider(names_from = fileName, values_from = TPM, values_fn = median) %>% # switch from "long format" to "wide format" 
+  as.data.frame()
+
+# Catch patient IDs
+PID_rnaseq <- unlist(lapply(tsv_rnaseq, function(x) lapply(strsplit(x, "_")[[1]][[2]], 
+                                               function(y) lapply(strsplit(y, "-")[[1]][[2]], 
+                                                                              function(z) strsplit(z, "\\.")[[1]][[1]]))))
+
+# Set rownames and colnames
+rownames(counts) <- counts$name
+counts <- counts[,-1]
+colnames(counts) <- PID_rnaseq
+
+
+# Save table
+write.table(counts, file = "/omics/groups/OE0436/data/jimenez/data/rnaseq/rnaseq_tpm_met4.tsv",
+            sep = "\t", col.names = TRUE, row.names = TRUE)
+```
+
+## Filter by protein-coding genes
+
+Our RNA-seq data includes miRNA and other genes. In some analyses, it will be better to only focus on protein-coding genes, so a matrix with only protein coding genes expression data is done. 
+
+```{r}
+# Select genes database and hsapiens dataset with ensembl
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl") 
+
+ensid <- ex$gene_id # Ensembl ID of the genes in our counts tables
+keytypes(ensembl) # ensembl_gene_id is what we are providing
+searchAttributes(mart = ensembl, pattern = "type") # gene_biotype is what we want to know
+searchFilters(mart = ensembl)
+
+# Query
+gene_types <- getBM(mart = ensembl, values = unlist(lapply(strsplit(ensid, "\\."), function(x) x[1])), 
+            attributes = c("ensembl_gene_id", "gene_biotype"),
+            filters = c("ensembl_gene_id"))
+            # keytype = "ensembl_gene_id")
+
+protein_coding_ensembl <- gene_types$ensembl_gene_id[gene_types$gene_biotype == "protein_coding"]
+
+# We are going to catch the names of these genes through the example file
+ex$ensg_id <- unlist(lapply(strsplit(ex$gene_id, "\\."), function(x) x[1])) # create column with the ENSG (without the points)
+
+protein_coding_name <- ex$name[ex$ensg_id %in% protein_coding_ensembl]
+
+# Filter counts table 
+counts_pc <- counts %>% 
+  mutate(name = rownames(counts)) %>% 
+  filter(name %in% protein_coding_name) %>%
+  dplyr::select(!name)
+
+# Save table
+write.table(counts_pc, 
+        file = "/omics/groups/OE0436/data/jimenez/data/rnaseq/rnaseq_tpm_met4_protein_coding.tsv",
+        sep = "\t", col.names = TRUE, row.names = TRUE)
+```
+
+## Bibliography
+
+1. Zhao, S., Ye, Z., & Stanton, R. (2020). Misuse of RPKM or TPM normalization when comparing across samples and sequencing protocols. *RNA*(New York, N.Y.), 26(8), 903–909. https://doi.org/10.1261/rna.074922.120
